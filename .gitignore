@@ -1,15 +1,3 @@
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-build/
-.eggs/
-*.egg
-.venv/
-venv/
-.env
-*.png
-*.jpg
-*.pdf
-.idea/
-.vscode/
+tmp_*
