@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Ivey"},
+    {name = "yifei"},
 ]
 keywords = ["ocr", "pdf", "deepseek", "markdown"]
 classifiers = [

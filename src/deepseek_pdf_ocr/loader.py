@@ -53,7 +53,27 @@ def load_ocr_results_for_llm(
         )
 
         if not include_images:
-            llm_content.append({"type": "text", "text": text})
+            # llm_content.append({"type": "text", "text": text})
+            # 【核心修改点】: 此时不转 base64，但要修复相对路径为绝对路径
+            # 这样 Agent (Langflow) 才能根据绝对路径在磁盘上找到图片
+            
+            def replace_with_abs_path(match):
+                alt_text = match.group(1)
+                rel_path = match.group(2)
+                
+                # 拼接绝对路径
+                abs_img_path = (page_dir / rel_path).resolve()
+                
+                # 如果文件存在，替换为绝对路径；否则保留原样
+                if abs_img_path.exists():
+                    # 注意：在 Windows 上 str(Path) 会生成反斜杠，通常 Markdown 解析器能处理
+                    # 为了兼容性最好，也可以使用 .as_posix()，但 Langflow 本地加载可能更喜欢系统原声路径
+                    return f"![{alt_text}]({str(abs_img_path)})"
+                return match.group(0)
+
+            # 使用正则 sub 函数进行全文替换
+            text_with_abs_paths = img_pattern.sub(replace_with_abs_path, text)
+            llm_content.append({"type": "text", "text": text_with_abs_paths})
         else:
             last_end = 0
             for m in img_pattern.finditer(text):
