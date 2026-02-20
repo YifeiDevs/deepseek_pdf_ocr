@@ -42,7 +42,7 @@ def merge_page_markdowns(
 
         text = _IMG_PATTERN.sub(_rewrite_img, md_path.read_text(encoding="utf-8"))
         sep = "\n\n---\n\n" if parts else ""
-        parts.append(f"{sep}## Page {page_num}\n\n{text.rstrip()}\n")
+        parts.append(f"{sep}<|ref|>page_no<|/ref|>\n{page_num}\n\n{text.rstrip()}\n")
 
     merged_path = base_dir / merged_filename
     merged_path.write_text("".join(parts), encoding="utf-8")
