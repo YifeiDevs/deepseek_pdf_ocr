@@ -10,6 +10,7 @@ from deepseek_pdf_ocr.pdf_utils import pdf_to_images, extract_text_from_pdf, get
 from deepseek_pdf_ocr.ocr import run_deepseek_ocr
 from deepseek_pdf_ocr.correction import run_gpt_correction
 from deepseek_pdf_ocr.post_process import process_single_page
+from deepseek_pdf_ocr.merge_markdown import merge_page_markdowns
 
 
 def run_pipeline(
@@ -23,6 +24,8 @@ def run_pipeline(
     ds_model: str = "deepseek-ocr-2",
     gpt_model: str = "gpt-5.2",
     gpt_temperature: float = 1.0,
+    merge_markdown: bool = True,
+    merged_filename: str = "merged.md",
 ) -> Path:
     """执行完整的 PDF OCR pipeline。
 
@@ -46,6 +49,10 @@ def run_pipeline(
         GPT 校正模型名称。
     gpt_temperature : float
         GPT 采样温度。
+    merge_markdown : bool
+        是否在 pipeline 结束后合并所有页的 result.md。
+    merged_filename : str
+        合并后的 Markdown 文件名（写入工作目录根，即 output 的父目录）。
 
     Returns
     -------
@@ -167,6 +174,17 @@ def run_pipeline(
             print(f"  ✓ 第 {page_num} 页后处理完成")
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页后处理失败: {e}")
+
+    if merge_markdown:
+        # ── Step 6: 合并所有页 Markdown ──
+        print("\n" + "=" * 60)
+        print("Step 6: 合并所有页 Markdown")
+        print("=" * 60)
+        try:
+            merged_md = merge_page_markdowns(output_dir, merged_filename=merged_filename)
+            print(f"✓ 已生成合并文件: {merged_md}")
+        except Exception as e:
+            print(f"✗ 合并 Markdown 失败: {e}")
 
     # ── 完成 ──
     print("\n" + "=" * 60)

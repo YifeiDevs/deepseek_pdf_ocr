@@ -29,6 +29,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--ds-model", default="deepseek-ocr-2", help="DeepSeek OCR 模型名")
     parser.add_argument("--gpt-model", default="gpt-5.2", help="GPT 校正模型名")
     parser.add_argument("--gpt-temperature", type=float, default=1.0, help="GPT 采样温度")
+    parser.add_argument(
+        "--no-merge-markdown",
+        action="store_true",
+        help="不生成合并 Markdown（默认会在工作目录根生成 merged.md，并合并所有页 result.md）",
+    )
+    parser.add_argument(
+        "--merged-filename",
+        default="merged.md",
+        help="合并后的 Markdown 文件名（写入 output 目录）",
+    )
 
     args = parser.parse_args(argv)
 
@@ -44,6 +54,8 @@ def main(argv: list[str] | None = None) -> None:
         ds_model=args.ds_model,
         gpt_model=args.gpt_model,
         gpt_temperature=args.gpt_temperature,
+        merge_markdown=not args.no_merge_markdown,
+        merged_filename=args.merged_filename,
     )
 
 
