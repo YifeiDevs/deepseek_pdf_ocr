@@ -10,7 +10,7 @@ _IMG_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 
 def merge_page_markdowns(
     output_dir: str | Path,
-    merged_filename: str = "merged.md",
+    merged_filename: str = "ocr.md",
 ) -> Path:
     output_dir = Path(output_dir)
     if not output_dir.exists():

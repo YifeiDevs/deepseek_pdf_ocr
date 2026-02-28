@@ -233,7 +233,7 @@ def process_single_page(
     ):
         processed_content = processed_content.replace(
             a_match_image,
-            f"![](images/{idx}.jpg)\n",
+            f"{a_match_image}\n![](images/{idx}.jpg)\n",
         )
 
     # # 移除其他ref标记  — 僵尸代码，按要求保留

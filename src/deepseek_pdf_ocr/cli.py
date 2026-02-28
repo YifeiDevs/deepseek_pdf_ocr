@@ -32,11 +32,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--no-merge-markdown",
         action="store_true",
-        help="不生成合并 Markdown（默认会在工作目录根生成 merged.md，并合并所有页 result.md）",
+        help="不生成合并 Markdown（默认会在工作目录根生成 ocr.md，并合并所有页 result.md）",
     )
     parser.add_argument(
         "--merged-filename",
-        default="merged.md",
+        default="ocr.md",
         help="合并后的 Markdown 文件名（写入 output 目录）",
     )
 

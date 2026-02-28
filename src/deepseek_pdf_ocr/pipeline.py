@@ -25,7 +25,7 @@ def run_pipeline(
     gpt_model: str = "gpt-5.2",
     gpt_temperature: float = 1.0,
     merge_markdown: bool = True,
-    merged_filename: str = "merged.md",
+    merged_filename: str = "ocr.md",
 ) -> Path:
     """执行完整的 PDF OCR pipeline。
 
