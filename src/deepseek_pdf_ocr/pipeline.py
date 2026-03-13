@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from tqdm import tqdm
@@ -11,6 +12,47 @@ from deepseek_pdf_ocr.ocr import run_deepseek_ocr
 from deepseek_pdf_ocr.correction import run_gpt_correction
 from deepseek_pdf_ocr.post_process import process_single_page
 from deepseek_pdf_ocr.merge_markdown import merge_page_markdowns
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable duration string."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {secs:.2f}s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{int(hours)}h {int(minutes)}m {secs:.2f}s"
+
+
+def _print_timing_report(timings: dict[str, float], total_time: float) -> None:
+    """Print a nicely aligned timing report after the pipeline finishes."""
+    print("\n" + "=" * 70)
+    print("  Timing Report")
+    print("=" * 70)
+
+    name_width = max(len(name) for name in timings)
+    bar_total = 40
+
+    for name, duration in timings.items():
+        pct = (duration / total_time * 100) if total_time > 0 else 0
+        filled = int(pct / 100 * bar_total)
+        bar = "█" * filled + "░" * (bar_total - filled)
+        print(
+            f"  {name:<{name_width}}"
+            f"  {_format_duration(duration):>12}"
+            f"  {pct:5.1f}%"
+            f"  {bar}"
+        )
+
+    separator_width = name_width + 12 + 5 + bar_total + 10
+    print(f"  {'─' * separator_width}")
+    print(
+        f"  {'Total':<{name_width}}"
+        f"  {_format_duration(total_time):>12}"
+        f"  100.0%"
+    )
+    print("=" * 70)
 
 
 def run_pipeline(
@@ -63,6 +105,10 @@ def run_pipeline(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF文件不存在: {pdf_path}")
 
+    # ── Timers ──
+    timings: dict[str, float] = {}
+    pipeline_start = time.perf_counter()
+
     # ── 目录结构 ──
     base_dir = pdf_path.parent / pdf_path.stem
     images_dir = base_dir / "images_pages"
@@ -80,26 +126,31 @@ def run_pipeline(
     print("=" * 60)
     print("Step 1: PDF 转高清图像")
     print("=" * 60)
+    step_start = time.perf_counter()
     existing_images = list(images_dir.glob("*.png"))
     if len(existing_images) == num_pages:
         print(f"✓ 检测到已存在 {num_pages} 张图像，跳过转换。")
     else:
         num_pages = pdf_to_images(pdf_path, images_dir, dpi=dpi)
+    timings["Step 1: PDF to Images"] = time.perf_counter() - step_start
 
     # ── Step 2: 提取 PDF 文本 ──
     print("\n" + "=" * 60)
     print("Step 2: 提取PDF内嵌文本")
     print("=" * 60)
+    step_start = time.perf_counter()
     pdf_texts = extract_text_from_pdf(pdf_path)
     for page_num, text in pdf_texts.items():
         text_file = text_dir / f"page-{page_num}-text.txt"
         text_file.write_text(text, encoding="utf-8")
     print(f"✓ 已提取 {len(pdf_texts)} 页文本")
+    timings["Step 2: Extract PDF Text"] = time.perf_counter() - step_start
 
     # ── Step 3: DeepSeek OCR ──
     print("\n" + "=" * 60)
     print("Step 3: DeepSeek OCR-2")
     print("=" * 60)
+    step_start = time.perf_counter()
     for page_num in tqdm(range(1, num_pages + 1), desc="OCR处理"):
         image_path = images_dir / f"{page_num}.png"
         ocr_output = ocr_dir / f"page-{page_num}.md"
@@ -116,11 +167,13 @@ def run_pipeline(
             print(f"  ✓ 第 {page_num} 页 OCR 完成")
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页 OCR 失败: {e}")
+    timings["Step 3: DeepSeek OCR"] = time.perf_counter() - step_start
 
     # ── Step 4: GPT 校正 ──
     print("\n" + "=" * 60)
     print("Step 4: GPT 校正")
     print("=" * 60)
+    step_start = time.perf_counter()
     for page_num in tqdm(range(1, num_pages + 1), desc="GPT校正"):
         ocr_file = ocr_dir / f"page-{page_num}.md"
         gpt_output = gpt_dir / f"page-{page_num}.md"
@@ -150,11 +203,13 @@ def run_pipeline(
             print(f"  ✓ 第 {page_num} 页 GPT 校正完成")
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页 GPT 校正失败: {e}")
+    timings["Step 4: GPT Correction"] = time.perf_counter() - step_start
 
     # ── Step 5: 后处理 ──
     print("\n" + "=" * 60)
     print("Step 5: 后处理 (提取图片、绘制边框)")
     print("=" * 60)
+    step_start = time.perf_counter()
     for page_num in range(1, num_pages + 1):
         page_out = output_dir / f"page-{page_num}"
         if (
@@ -174,17 +229,22 @@ def run_pipeline(
             print(f"  ✓ 第 {page_num} 页后处理完成")
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页后处理失败: {e}")
+    timings["Step 5: Post-processing"] = time.perf_counter() - step_start
 
     if merge_markdown:
         # ── Step 6: 合并所有页 Markdown ──
         print("\n" + "=" * 60)
         print("Step 6: 合并所有页 Markdown")
         print("=" * 60)
+        step_start = time.perf_counter()
         try:
             merged_md = merge_page_markdowns(output_dir, merged_filename=merged_filename)
             print(f"✓ 已生成合并文件: {merged_md}")
         except Exception as e:
             print(f"✗ 合并 Markdown 失败: {e}")
+        timings["Step 6: Merge Markdown"] = time.perf_counter() - step_start
+
+    total_time = time.perf_counter() - pipeline_start
 
     # ── 完成 ──
     print("\n" + "=" * 60)
@@ -201,5 +261,8 @@ def run_pipeline(
     print(f"  - result.md:             处理后的markdown文件(带图片引用)")
     print(f"  - result_with_boxes.jpg: 带可视化边框的图片")
     print(f"  - images/:               提取的图片文件夹")
+
+    # ── Timing Report ──
+    _print_timing_report(timings, total_time)
 
     return output_dir
