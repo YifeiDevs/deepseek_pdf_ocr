@@ -15,6 +15,12 @@ def run_pipeline(*args, **kwargs):
     return _run_pipeline(*args, **kwargs)
 
 
+def run_pipeline_vllm(*args, **kwargs):
+    """惰性导入，避免 import 包时强依赖 vLLM 等重模块。"""
+    from deepseek_pdf_ocr.pipeline_vllm import run_pipeline_vllm as _run_pipeline_vllm
+
+    return _run_pipeline_vllm(*args, **kwargs)
+
 def load_ocr_results_for_llm(*args, **kwargs):
     """惰性导入，避免 import 包时强依赖重模块。"""
     from deepseek_pdf_ocr.loader import load_ocr_results_for_llm as _load
@@ -22,6 +28,6 @@ def load_ocr_results_for_llm(*args, **kwargs):
     return _load(*args, **kwargs)
 
 
-__all__ = ["run_pipeline", "load_ocr_results_for_llm"]
+__all__ = ["run_pipeline", "run_pipeline_vllm", "load_ocr_results_for_llm"]
 
 __version__ = "0.1.0"
