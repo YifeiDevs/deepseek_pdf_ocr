@@ -1,425 +1,385 @@
+# src/deepseek_pdf_ocr/pipeline_vllm.py
+"""主 pipeline (vLLM 批量推理)：PDF → 批量 OCR → GPT 校正 → Markdown。
+
+与 ``pipeline.py`` 功能完全一致，唯一区别在于 **Step 3 (DeepSeek OCR)**:
+利用 ``ocr_api_server_vllm`` 的多图批量接口，将多张页面图像合并为一次
+请求发送，大幅提升大规模 PDF 的吞吐量。
+
+新增参数 ``ds_batch_size`` 控制每次 API 请求并行 OCR 的页数。
 """
-ocr_api_server_vllm.py – DeepSeek-OCR-2 OpenAI-Compatible API (vLLM Backend)
-=============================================================================
 
-Drop-in replacement for ``ocr_api_server.py`` powered by **vLLM** for
-high-throughput batch inference.  Supports **text + multiple images** in a
-single request — each image is OCR'd independently via vLLM batching and the
-results are combined in the response.
-
-Endpoints (OpenAI-compatible)::
-
-    POST /v1/chat/completions   – OCR one or more images
-    GET  /v1/models             – list available models
-    GET  /health                – liveness probe
-
-Environment variables (all optional, defaults shown)::
-
-    DEEPSEEK_OCR_MODEL_DIR   ./DeepSeek-OCR-2      model weights directory
-    DEEPSEEK_OCR_VLLM_DIR                           vLLM adapter code path
-    CUDA_VISIBLE_DEVICES     0                       GPU selection
-    VLLM_MAX_NUM_SEQS        100                     max concurrent sequences
-    VLLM_TP_SIZE             1                       tensor-parallel GPUs
-    VLLM_GPU_UTIL            0.75                    GPU memory fraction
-    OCR_PORT                 8765                    HTTP port
-
-Usage::
-
-    python ocr_api_server_vllm.py
-"""
 from __future__ import annotations
 
 import base64
-import os
-import socket
-import sys
+import re
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
-from typing import List, Literal, Optional, Union
+from pathlib import Path
+from typing import Sequence
 
-import torch
-from PIL import Image
+from openai import OpenAI
+from tqdm import tqdm
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  1. Environment  (MUST precede any vLLM / triton import)   ║
-# ╚══════════════════════════════════════════════════════════════╝
-if getattr(torch.version, "cuda", None) == "11.8":
-    os.environ.setdefault(
-        "TRITON_PTXAS_PATH", "/usr/local/cuda-11.8/bin/ptxas"
-    )
-os.environ["VLLM_USE_V1"] = "0"
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-
-# Add the vLLM adapter package to sys.path when supplied
-_adapter_dir = os.environ.get("DEEPSEEK_OCR_VLLM_DIR", "")
-if _adapter_dir and _adapter_dir not in sys.path:
-    sys.path.insert(0, _adapter_dir)
-
-sys.path.append(r"/home/shunshunliu/yifei/OCR/DS-OCR-v2/vllm/DeepSeek-OCR-2/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm")
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  2. vLLM + DeepSeek-OCR-2 adapter imports                  ║
-# ╚══════════════════════════════════════════════════════════════╝
-from vllm import LLM, SamplingParams                              # noqa: E402
-from vllm.model_executor.models.registry import ModelRegistry      # noqa: E402
-
-from deepseek_ocr2 import DeepseekOCR2ForCausalLM                 # noqa: E402
-from process.ngram_norepeat import NoRepeatNGramLogitsProcessor    # noqa: E402
-from process.image_process import DeepseekOCR2Processor            # noqa: E402
-from config import CROP_MODE                                       # noqa: E402
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  3. Model code patch                                        ║
-# ║     Reused from ocr_api_server.patch_deepseek_ocr_code      ║
-# ║     (Inlined because importing that module would trigger     ║
-# ║      HF model loading, transformers version pin, etc.)       ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-
-def patch_deepseek_ocr_code(model_dir: str = "./DeepSeek-OCR-2") -> None:
-    """Patch ``modeling_deepseekocr2.py`` so that
-    ``model.infer(..., save_results=True)`` returns the raw OCR text.
-    Idempotent — safe to call more than once.
-    """
-    target = os.path.join(model_dir, "modeling_deepseekocr2.py")
-    if not os.path.exists(target):
-        print(f"[patch] skip — {target} not found")
-        return
-
-    with open(target, "r", encoding="utf-8") as fh:
-        src = fh.read()
-
-    # — anchor 1: save the raw text before post-processing —
-    a1 = "matches_ref, matches_images, mathes_other = re_match(outputs)"
-    p1 = (
-        "\n            raw_text = outputs"
-        "  # [Patch] Save original text before processing\n            "
-    )
-    if "raw_text = outputs  # [Patch]" not in src:
-        if a1 not in src:
-            print("[patch] anchor-1 not found")
-            return
-        src = src.replace(a1, p1 + a1)
-
-    # — anchor 2: return raw text after saving the debug image —
-    a2 = 'result.save(f"{output_path}/result_with_boxes.jpg")'
-    p2 = (
-        "\n            # [Patch] Return original text"
-        " when save_results=True\n            return raw_text\n"
-    )
-    if "return raw_text" in src.split(a2)[-1][:200]:
-        print("[patch] already applied")
-        return
-    if a2 not in src:
-        print("[patch] anchor-2 not found")
-        return
-    src = src.replace(a2, a2 + p2)
-
-    with open(target, "w", encoding="utf-8") as fh:
-        fh.write(src)
-    print(f"[patch] ✓ patched {target}")
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  4. Download model weights (first run) & apply patch        ║
-# ╚══════════════════════════════════════════════════════════════╝
-MODEL_DIR: str = os.environ.get("DEEPSEEK_OCR_MODEL_DIR", "./DeepSeek-OCR-2")
-
-if not os.path.exists(MODEL_DIR):
-    from huggingface_hub import snapshot_download  # noqa: E402
-
-    MODEL_DIR = snapshot_download(
-        "deepseek-ai/DeepSeek-OCR-2",
-        local_dir=MODEL_DIR,
-        local_dir_use_symlinks=False,
-    )
-    patch_deepseek_ocr_code(MODEL_DIR)
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  5. Register architecture & start vLLM engine               ║
-# ╚══════════════════════════════════════════════════════════════╝
-ModelRegistry.register_model(
-    "DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM
+# ── Reuse utilities from the original pipeline & sister modules ──
+from deepseek_pdf_ocr.pdf_utils import (
+    pdf_to_images,
+    extract_text_from_pdf,
+    get_page_count,
 )
+from deepseek_pdf_ocr.correction import run_gpt_correction
+from deepseek_pdf_ocr.post_process import process_single_page
+from deepseek_pdf_ocr.merge_markdown import merge_page_markdowns
+from deepseek_pdf_ocr.pipeline import _format_duration, _print_timing_report
 
-print("[vllm] Loading engine …")
-llm = LLM(
-    model=MODEL_DIR,
-    hf_overrides={"architectures": ["DeepseekOCR2ForCausalLM"]},
-    block_size=256,
-    enforce_eager=False,
-    trust_remote_code=True,
-    max_model_len=8192,
-    swap_space=0,
-    max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", "100")),
-    tensor_parallel_size=int(os.environ.get("VLLM_TP_SIZE", "1")),
-    gpu_memory_utilization=float(os.environ.get("VLLM_GPU_UTIL", "0.75")),
-)
-print("[vllm] ✓ Engine ready")
-
-# Shared stateless logits processors (safe to reuse across requests)
-_LOGITS_PROCS = [
-    NoRepeatNGramLogitsProcessor(
-        ngram_size=20,
-        window_size=90,
-        whitelist_token_ids={128821, 128822},
-    )
-]
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  6. FastAPI application                                      ║
+# ║  Internal helpers                                            ║
 # ╚══════════════════════════════════════════════════════════════╝
-from fastapi import FastAPI, HTTPException  # noqa: E402
-from pydantic import BaseModel  # noqa: E402
-
-app = FastAPI(title="DeepSeek-OCR-2 (vLLM)")
-
-# ── Request / Response schemas (OpenAI-compatible) ────────────
 
 
-class ImageContent(BaseModel):
-    type: Literal["image_url"]
-    image_url: dict  # {"url": "data:image/…;base64,…" | "https://…"}
+def _encode_image_b64(path: str | Path) -> str:
+    """Read an image file and return its base64-encoded string."""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
-class TextContent(BaseModel):
-    type: Literal["text"]
-    text: str
+# Matches ``<!-- image N -->`` headers emitted by ``ocr_api_server_vllm``
+_IMAGE_MARKER_RE = re.compile(r"<!--\s*image\s+(\d+)\s*-->")
 
 
-class Message(BaseModel):
-    role: str
-    content: Union[str, List[Union[TextContent, ImageContent]]]
+def _split_batch_response(text: str, expected: int) -> list[str]:
+    """Split a combined multi-image response into *expected* individual results.
 
+    ``ocr_api_server_vllm`` formats multi-image results as::
 
-class ChatCompletionRequest(BaseModel):
-    model: str = "deepseek-ocr-2"
-    messages: List[Message]
-    temperature: Optional[float] = 0.0
-    max_tokens: Optional[int] = 8192
-    stream: Optional[bool] = False
+        <!-- image 1 -->
+        …per-page OCR content…
 
+        ---
 
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[dict]
-    usage: dict
+        <!-- image 2 -->
+        …per-page OCR content…
 
+    Single-image responses contain **no** markers and are returned as-is.
 
-# ── Helpers ───────────────────────────────────────────────────
+    Parameters
+    ----------
+    text : str
+        Raw ``response.choices[0].message.content``.
+    expected : int
+        Number of images that were sent in the batch.
 
-
-def _decode_image(src: str) -> Image.Image:
-    """Base64 data-URI **or** HTTP(S) URL → PIL RGB Image."""
-    if src.startswith("data:image"):
-        raw = base64.b64decode(src.split(",", 1)[1])
-        return Image.open(BytesIO(raw)).convert("RGB")
-    if src.startswith(("http://", "https://")):
-        import requests as _rq  # lazy — not needed for base64 only
-
-        r = _rq.get(src, timeout=60)
-        r.raise_for_status()
-        return Image.open(BytesIO(r.content)).convert("RGB")
-    raise ValueError(f"Unsupported image source: {src[:120]}")
-
-
-def _extract_content(
-    messages: List[Message],
-) -> tuple[str, list[Image.Image]]:
-    """Parse OpenAI-style messages → ``(prompt_text, [PIL images])``."""
-    texts: list[str] = []
-    images: list[Image.Image] = []
-    for msg in messages:
-        if isinstance(msg.content, str):
-            texts.append(msg.content)
-        elif isinstance(msg.content, list):
-            for part in msg.content:
-                if part.type == "text":
-                    texts.append(part.text)
-                elif part.type == "image_url":
-                    url = part.image_url.get("url", "")
-                    if url:
-                        images.append(_decode_image(url))
-    prompt = "\n".join(t for t in texts if t.strip()).strip()
-    return (prompt or "Convert the document to markdown."), images
-
-
-def _preprocess_one(image: Image.Image, prompt: str) -> dict:
-    """Tokenise **one** image on the CPU and return a vLLM input dict."""
-    data = DeepseekOCR2Processor().tokenize_with_images(
-        images=[image],
-        bos=True,
-        eos=True,
-        cropping=CROP_MODE,
-    )
-    return {"prompt": prompt, "multi_modal_data": {"image": data}}
-
-
-# ── Endpoints ─────────────────────────────────────────────────
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    """OCR one **or more** images.
-
-    Multiple ``image_url`` items are processed as an efficient vLLM
-    **batch** and the results are merged into a single response.
+    Returns
+    -------
+    list[str]
+        A list of length *expected*; missing entries are empty strings.
     """
-    if request.stream:
-        raise HTTPException(400, "Streaming is not supported.")
+    if expected <= 1:
+        return [text.strip()]
 
-    try:
-        user_prompt, images = _extract_content(request.messages)
-        if not images:
-            raise HTTPException(400, "No image provided in the request.")
+    markers = list(_IMAGE_MARKER_RE.finditer(text))
+    if not markers:
+        # Fallback: server returned plain text without markers
+        return [text.strip()] + [""] * (expected - 1)
 
-        ocr_prompt = f"<image>\n<|grounding|>{user_prompt}"
+    # Build {1-based image index → content} mapping
+    segments: dict[int, str] = {}
+    for i, m in enumerate(markers):
+        idx = int(m.group(1))
+        start = m.end()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+        chunk = text[start:end]
+        # Strip the trailing ``\n\n---\n\n`` separator between images
+        chunk = re.sub(r"\s*---\s*$", "", chunk)
+        segments[idx] = chunk.strip()
 
-        sampling = SamplingParams(
-            temperature=request.temperature or 0.0,
-            max_tokens=request.max_tokens or 8192,
-            logits_processors=_LOGITS_PROCS,
-            skip_special_tokens=False,
-        )
+    return [segments.get(i, "") for i in range(1, expected + 1)]
 
-        # ── Parallel CPU preprocessing ──
-        with ThreadPoolExecutor(max_workers=min(len(images), 16)) as pool:
-            vllm_inputs: list[dict] = list(
-                pool.map(
-                    lambda img: _preprocess_one(img, ocr_prompt), images
-                )
+
+def _run_batch_ocr(
+    page_nums: Sequence[int],
+    images_dir: Path,
+    ocr_dir: Path,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    batch_size: int,
+) -> None:
+    """OCR pages in batches via the vLLM OpenAI-compatible endpoint.
+
+    Pages whose output (``ocr_dir/page-{N}.md``) already exists are
+    automatically skipped.
+    """
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    # ── filter out already-completed pages ──
+    todo: list[int] = []
+    for pn in page_nums:
+        if (ocr_dir / f"page-{pn}.md").exists():
+            print(f"  跳过第 {pn} 页 (已存在)")
+        else:
+            todo.append(pn)
+
+    if not todo:
+        print("  所有页面 OCR 结果已存在，跳过。")
+        return
+
+    # ── send images in batches ──
+    n_batches = (len(todo) + batch_size - 1) // batch_size
+    for bi in tqdm(
+        range(0, len(todo), batch_size),
+        desc="OCR批量处理",
+        total=n_batches,
+    ):
+        batch = todo[bi : bi + batch_size]
+
+        # Build multi-image content for the OpenAI-style API
+        content: list[dict] = [
+            {"type": "text", "text": "Convert the document to markdown."},
+        ]
+        for pn in batch:
+            b64 = _encode_image_b64(images_dir / f"{pn}.png")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
             )
 
-        # ── Batch GPU inference ──
-        outputs = llm.generate(vllm_inputs, sampling, use_tqdm=True)
-
-        # ── Assemble response text ──
-        if len(outputs) == 1:
-            result_text = outputs[0].outputs[0].text
-        else:
-            parts = [
-                f"<!-- image {i} -->\n{o.outputs[0].text}"
-                for i, o in enumerate(outputs, 1)
-            ]
-            result_text = "\n\n---\n\n".join(parts)
-
-        # Token accounting (exact, from vLLM internals)
-        prompt_tokens = sum(len(o.prompt_token_ids) for o in outputs)
-        completion_tokens = sum(
-            len(o.outputs[0].token_ids) for o in outputs
-        )
-
-        return ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4()}",
-            created=int(time.time()),
-            model=request.model,
-            choices=[
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": result_text,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            usage={
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-        )
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
-
-
-@app.get("/v1/models")
-async def list_models():
-    """List available models (OpenAI-compatible)."""
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "deepseek-ocr-2",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "deepseek",
-            }
-        ],
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Liveness probe."""
-    return {
-        "status": "ok",
-        "backend": "vllm",
-        "model_loaded": llm is not None,
-    }
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+            )
+            parts = _split_batch_response(
+                resp.choices[0].message.content,
+                len(batch),
+            )
+            for pn, txt in zip(batch, parts):
+                (ocr_dir / f"page-{pn}.md").write_text(txt, encoding="utf-8")
+                print(f"  ✓ 第 {pn} 页 OCR 完成")
+        except Exception as exc:
+            for pn in batch:
+                print(f"  ✗ 第 {pn} 页 OCR 失败: {exc}")
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  7. CLI entry-point                                          ║
+# ║  Public API                                                  ║
 # ╚══════════════════════════════════════════════════════════════╝
-if __name__ == "__main__":
-    import uvicorn
 
-    def _local_ip() -> str:
+
+def run_pipeline_vllm(
+    pdf_path: str | Path,
+    ds_api_key: str,
+    ds_base_url: str,
+    gpt_api_key: str,
+    gpt_endpoint: str,
+    *,
+    dpi: int = 300,
+    ds_model: str = "deepseek-ocr-2",
+    ds_batch_size: int = 1,
+    gpt_model: str = "gpt-5.2",
+    gpt_temperature: float = 1.0,
+    merge_markdown: bool = True,
+    merged_filename: str = "ocr.md",
+) -> Path:
+    """Execute the full PDF OCR pipeline using the vLLM batch backend.
+
+    API-compatible with :func:`pipeline.run_pipeline`; the only addition
+    is *ds_batch_size*.
+
+    Parameters
+    ----------
+    pdf_path : path-like
+        输入 PDF 文件路径。
+    ds_api_key : str
+        DeepSeek OCR API Key。
+    ds_base_url : str
+        DeepSeek OCR API base URL。
+    gpt_api_key : str
+        GPT 校正 API Key。
+    gpt_endpoint : str
+        GPT 校正 API endpoint。
+    dpi : int
+        PDF 渲染 DPI。
+    ds_model : str
+        DeepSeek OCR 模型名称。
+    ds_batch_size : int
+        **每次 OCR 请求并行处理的页数**。
+
+        - ``1`` — 逐页发送，行为与 ``pipeline.run_pipeline`` 完全相同。
+        - ``> 1`` — 多张图片打包为一个请求，由 vLLM 引擎批量推理后
+          拆分回各页结果。值越大吞吐越高，但单次请求 payload 与延迟
+          也越大，请根据 GPU 显存和网络情况调整。
+    gpt_model : str
+        GPT 校正模型名称。
+    gpt_temperature : float
+        GPT 采样温度。
+    merge_markdown : bool
+        是否在 pipeline 结束后合并所有页的 result.md。
+    merged_filename : str
+        合并后的 Markdown 文件名（写入工作目录根）。
+
+    Returns
+    -------
+    Path
+        输出根目录 (``output_dir``)。
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF文件不存在: {pdf_path}")
+
+    timings: dict[str, float] = {}
+    t_pipeline = time.perf_counter()
+
+    # ── Directory layout (identical to pipeline.py) ──
+    base_dir = pdf_path.parent / pdf_path.stem
+    images_dir = base_dir / "images_pages"
+    text_dir = base_dir / "pdf_text"
+    ocr_dir = base_dir / "deepseek-ocr-2"
+    gpt_dir = base_dir / "gpt5.2"
+    output_dir = base_dir / "output"
+
+    for d in (base_dir, images_dir, text_dir, ocr_dir, gpt_dir, output_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    num_pages = get_page_count(pdf_path)
+
+    # ════════════ Step 1: PDF → 高清图像 ════════════
+    print("=" * 60)
+    print("Step 1: PDF 转高清图像")
+    print("=" * 60)
+    t0 = time.perf_counter()
+    existing_images = list(images_dir.glob("*.png"))
+    if len(existing_images) == num_pages:
+        print(f"✓ 检测到已存在 {num_pages} 张图像，跳过转换。")
+    else:
+        num_pages = pdf_to_images(pdf_path, images_dir, dpi=dpi)
+    timings["Step 1: PDF to Images"] = time.perf_counter() - t0
+
+    # ════════════ Step 2: 提取 PDF 内嵌文本 ════════════
+    print("\n" + "=" * 60)
+    print("Step 2: 提取PDF内嵌文本")
+    print("=" * 60)
+    t0 = time.perf_counter()
+    pdf_texts = extract_text_from_pdf(pdf_path)
+    for pn, txt in pdf_texts.items():
+        (text_dir / f"page-{pn}-text.txt").write_text(txt, encoding="utf-8")
+    print(f"✓ 已提取 {len(pdf_texts)} 页文本")
+    timings["Step 2: Extract PDF Text"] = time.perf_counter() - t0
+
+    # ════════════ Step 3: DeepSeek OCR (vLLM batch) ════════════
+    print("\n" + "=" * 60)
+    print(f"Step 3: DeepSeek OCR-2  (vLLM, batch_size={ds_batch_size})")
+    print("=" * 60)
+    t0 = time.perf_counter()
+    _run_batch_ocr(
+        page_nums=list(range(1, num_pages + 1)),
+        images_dir=images_dir,
+        ocr_dir=ocr_dir,
+        api_key=ds_api_key,
+        base_url=ds_base_url,
+        model=ds_model,
+        batch_size=ds_batch_size,
+    )
+    timings["Step 3: DeepSeek OCR (vLLM)"] = time.perf_counter() - t0
+
+    # ════════════ Step 4: GPT 校正 ════════════
+    print("\n" + "=" * 60)
+    print("Step 4: GPT 校正")
+    print("=" * 60)
+    t0 = time.perf_counter()
+    for pn in tqdm(range(1, num_pages + 1), desc="GPT校正"):
+        ocr_file = ocr_dir / f"page-{pn}.md"
+        gpt_output = gpt_dir / f"page-{pn}.md"
+        image_path = images_dir / f"{pn}.png"
+
+        if gpt_output.exists():
+            print(f"  跳过第 {pn} 页 (已存在)")
+            continue
+        if not ocr_file.exists():
+            print(f"  跳过第 {pn} 页 (无OCR结果)")
+            continue
+
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
+            ocr_result = ocr_file.read_text(encoding="utf-8")
+            extracted_text = pdf_texts.get(pn, "")
 
-    PORT = int(os.environ.get("OCR_PORT", "8765"))
-    ip = _local_ip()
+            gpt_result = run_gpt_correction(
+                ocr_result,
+                str(image_path),
+                extracted_text,
+                gpt_api_key,
+                gpt_endpoint,
+                model=gpt_model,
+                temperature=gpt_temperature,
+            )
+            gpt_output.write_text(gpt_result, encoding="utf-8")
+            print(f"  ✓ 第 {pn} 页 GPT 校正完成")
+        except Exception as e:
+            print(f"  ✗ 第 {pn} 页 GPT 校正失败: {e}")
+    timings["Step 4: GPT Correction"] = time.perf_counter() - t0
 
-    print(
-        f"""
-{'=' * 55}
-🚀  DeepSeek-OCR-2  ·  vLLM Server
-    Local:   http://127.0.0.1:{PORT}/v1
-    Remote:  http://{ip}:{PORT}/v1
-{'=' * 55}
-"""
-    )
+    # ════════════ Step 5: 后处理 ════════════
+    print("\n" + "=" * 60)
+    print("Step 5: 后处理 (提取图片、绘制边框)")
+    print("=" * 60)
+    t0 = time.perf_counter()
+    for pn in range(1, num_pages + 1):
+        page_out = output_dir / f"page-{pn}"
+        if (
+            (page_out / "result.md").exists()
+            and (page_out / "result_with_boxes.jpg").exists()
+        ):
+            print(f"  跳过第 {pn} 页后处理 (结果已存在)")
+            continue
 
-    # ── Print quick-test snippets for the user ──
-    print(
-        f"""# ── Quick test (single image) ──
-from openai import OpenAI
-import base64
+        try:
+            process_single_page(
+                pn,
+                input_dir=str(gpt_dir),
+                output_dir=str(output_dir),
+                image_dir=str(images_dir),
+            )
+            print(f"  ✓ 第 {pn} 页后处理完成")
+        except Exception as e:
+            print(f"  ✗ 第 {pn} 页后处理失败: {e}")
+    timings["Step 5: Post-processing"] = time.perf_counter() - t0
 
-client = OpenAI(api_key="none", base_url="http://{ip}:{PORT}/v1")
+    # ════════════ Step 6: 合并 Markdown ════════════
+    if merge_markdown:
+        print("\n" + "=" * 60)
+        print("Step 6: 合并所有页 Markdown")
+        print("=" * 60)
+        t0 = time.perf_counter()
+        try:
+            merged_md = merge_page_markdowns(
+                output_dir, merged_filename=merged_filename,
+            )
+            print(f"✓ 已生成合并文件: {merged_md}")
+        except Exception as e:
+            print(f"✗ 合并 Markdown 失败: {e}")
+        timings["Step 6: Merge Markdown"] = time.perf_counter() - t0
 
-def enc(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+    total_time = time.perf_counter() - t_pipeline
 
-# ── Quick test (multi-image batch) ──
-resp = client.chat.completions.create(
-    model="deepseek-ocr-2",
-    messages=[{{"role": "user", "content": [
-        {{"type": "text", "text": "Convert the documents to markdown."}},
-        {{"type": "image_url", "image_url": {{"url": f"data:image/png;base64,{{enc('p1.png')}}"}} }},
-        {{"type": "image_url", "image_url": {{"url": f"data:image/png;base64,{{enc('p2.png')}}"}} }},
-    ]}}],
-)
-print(resp.choices[0].message.content)
-"""
-    )
+    # ── Summary ──
+    print("\n" + "=" * 60)
+    print("全部完成!")
+    print("=" * 60)
+    print(f"  PDF文件:        {pdf_path}")
+    print(f"  工作目录:       {base_dir}")
+    print(f"  页面图像:       {images_dir}")
+    print(f"  PDF内嵌文本:    {text_dir}")
+    print(f"  OCR原始结果:    {ocr_dir}")
+    print(f"  GPT校正结果:    {gpt_dir}")
+    print(f"  最终输出:       {output_dir}")
+    print(f"  OCR 批大小:     {ds_batch_size}")
+    print(f"\n每个页面的输出包括:")
+    print(f"  - result.md:             处理后的markdown文件(带图片引用)")
+    print(f"  - result_with_boxes.jpg: 带可视化边框的图片")
+    print(f"  - images/:               提取的图片文件夹")
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
-# python /home/shunshunliu/yifei/OCR/DS-OCR-v2/ocr_api_server_vllm.py
+    _print_timing_report(timings, total_time)
+
+    return output_dir
