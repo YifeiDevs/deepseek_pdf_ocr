@@ -387,13 +387,11 @@ if __name__ == "__main__":
     ip = _local_ip()
 
     print(
-        f"""
-{'=' * 55}
+        f"""{'=' * 55}
 🚀  DeepSeek-OCR-2  ·  vLLM Server
     Local:   http://127.0.0.1:{PORT}/v1
     Remote:  http://{ip}:{PORT}/v1
-{'=' * 55}
-"""
+{'=' * 55}"""
     )
 
     # ── Print quick-test snippets for the user ──
@@ -408,7 +406,7 @@ def enc(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
-# ── Quick test (multi-image batch) ──
+# ── Quick test ──
 resp = client.chat.completions.create(
     model="deepseek-ocr-2",
     messages=[{{"role": "user", "content": [
@@ -417,9 +415,46 @@ resp = client.chat.completions.create(
         {{"type": "image_url", "image_url": {{"url": f"data:image/png;base64,{{enc('p2.png')}}"}} }},
     ]}}],
 )
-print(resp.choices[0].message.content)
-"""
+print(resp.choices[0].message.content)"""
     )
+    print(r'''# 返回格式精简说明：
+# 1. 多图分割符：使用 来区分不同图片的识别结果（N为图片序号）。
+# 2. 元素结构：<|ref|>元素类型<|/ref|><|det|>[[左上X, 左上Y, 右下X, 右下Y]]<|/det|> \n 具体内容。
+# 3. 常见元素类型包括：image, figure_title, sub_title, text, equation, table 等。
 
+<!-- image 1 -->
+<|ref|>image<|/ref|><|det|>[[272, 20, 752, 232]]<|/det|>
+
+<|ref|>figure_title<|/ref|><|det|>[[170, 237, 822, 267]]<|/det|>
+Figure 2: (left) Scaled Dot-Product Attention...
+
+<|ref|>text<|/ref|><|det|>[[170, 358, 823, 414]]<|/det|>
+We call our particular attention "Scaled Dot-Product Attention"...
+
+<|ref|>equation<|/ref|><|det|>[[352, 478, 821, 512]]<|/det|>
+ \[  Attention(Q,K,V)=softmax(\frac{QK^{T}}{\sqrt{d_{k}}})V \quad (1) \] 
+
+<|ref|>table<|/ref|><|det|>[[192, 797, 802, 890]]<|/det|>
+<table><tr><td>Layer Type</td><td>...</tr></table>
+
+---
+
+<!-- image 2 -->
+
+<|ref|>text<|/ref|><|det|>[[272, 20, 752, 232]]<|/det|>
+
+---
+
+<!-- image 3 -->
+
+<|ref|>text<|/ref|><|det|>[[...]]<|/det|>
+
+---
+
+<!-- image 4 -->
+
+<|ref|>...<|/ref|><|det|>[[...],[...]]<|/det|>
+...
+''')
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 # python /home/shunshunliu/yifei/OCR/DS-OCR-v2/ocr_api_server_vllm.py

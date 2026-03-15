@@ -238,9 +238,10 @@ def run_pipeline_vllm(
     text_dir = base_dir / "pdf_text"
     ocr_dir = base_dir / "deepseek-ocr-2"
     gpt_dir = base_dir / "gpt5.2"
+    gpt_raw_dir = base_dir / "gpt5.2-raw"
     output_dir = base_dir / "output"
 
-    for d in (base_dir, images_dir, text_dir, ocr_dir, gpt_dir, output_dir):
+    for d in (base_dir, images_dir, text_dir, ocr_dir, gpt_dir, gpt_raw_dir, output_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     num_pages = get_page_count(pdf_path)
@@ -292,6 +293,7 @@ def run_pipeline_vllm(
     for pn in tqdm(range(1, num_pages + 1), desc="GPT校正"):
         ocr_file = ocr_dir / f"page-{pn}.md"
         gpt_output = gpt_dir / f"page-{pn}.md"
+        gpt_raw = gpt_raw_dir / f"page-{pn}.md"
         image_path = images_dir / f"{pn}.png"
 
         if gpt_output.exists():
@@ -305,7 +307,7 @@ def run_pipeline_vllm(
             ocr_result = ocr_file.read_text(encoding="utf-8")
             extracted_text = pdf_texts.get(pn, "")
 
-            gpt_result = run_gpt_correction(
+            result = run_gpt_correction(
                 ocr_result,
                 str(image_path),
                 extracted_text,
@@ -314,8 +316,13 @@ def run_pipeline_vllm(
                 model=gpt_model,
                 temperature=gpt_temperature,
             )
-            gpt_output.write_text(gpt_result, encoding="utf-8")
-            print(f"  ✓ 第 {pn} 页 GPT 校正完成")
+            gpt_output.write_text(result.corrected, encoding="utf-8")
+            gpt_raw.write_text(result.raw_response, encoding="utf-8")
+            print(
+                f"  ✓ 第 {pn} 页 GPT 校正完成"
+                f"  ({result.n_ok}/{result.n_sent} segments unchanged"
+                f", {result.n_image_skipped} image skipped)"
+            )
         except Exception as e:
             print(f"  ✗ 第 {pn} 页 GPT 校正失败: {e}")
     timings["Step 4: GPT Correction"] = time.perf_counter() - t0
