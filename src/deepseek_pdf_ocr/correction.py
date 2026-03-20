@@ -6,6 +6,11 @@ v2 优化
 - GPT 对已正确的段落只需返回 ``<|ok|>``，大幅节省 output token
 - ``<|ref|>image<|/ref|>`` 段自动跳过，不发送给 GPT（无文字可校正）
 - 只发段落类型标签（不暴露坐标），杜绝 GPT 误改坐标的风险
+
+v3 优化 (Search & Replace)
+-------
+- 引入 `<<<< ==== >>>>` 局部替换语法。
+- GPT 只需输出出错的那一两句话的修改，无需重写整个冗长的段落，速度翻倍。
 """
 
 from __future__ import annotations
@@ -37,6 +42,12 @@ _REF_TYPE_RE = re.compile(r"<\|ref\|>(.*?)<\|/ref\|>")
 # 宽容解析：兼容 GPT 回复 "[1]" 和 "[1 figure_title]" 两种格式
 _SEG_NUM_RE = re.compile(r"^\[(\d+)[^\]]*\]\s*", re.MULTILINE)
 
+# 匹配局部替换块 (Aider 风格)
+# 允许界定符前后存在空白字符
+_SEARCH_REPLACE_RE = re.compile(
+    r"<<<<\s*\n(.*?)\n\s*====\s*\n(.*?)\n\s*>>>>", re.DOTALL
+)
+
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  Data structures                                             ║
@@ -45,16 +56,13 @@ _SEG_NUM_RE = re.compile(r"^\[(\d+)[^\]]*\]\s*", re.MULTILINE)
 
 @dataclass
 class Segment:
-    """OCR 输出中的一个语义段落。"""
-
-    index: int           # 在原始文本中的绝对序号（用于重组）
-    header: str          # <|ref|>…<|/ref|><|det|>…<|/det|>  (前导文本为空串)
-    body: str            # header 之后、下一个 header 之前的全部原始文本
-    is_image: bool = False   # True → <|ref|>image<|/ref|> 段，跳过 GPT 校正
+    index: int           
+    header: str          
+    body: str            
+    is_image: bool = False   
 
     @property
     def ref_type(self) -> str:
-        """提取类型标签，如 ``text``, ``equation``, ``table``。"""
         if not self.header:
             return ""
         m = _REF_TYPE_RE.search(self.header)
@@ -67,24 +75,6 @@ class Segment:
 
 @dataclass
 class CorrectionResult:
-    """GPT 校正的完整结果。
-
-    Attributes
-    ----------
-    corrected : str
-        完全还原的校正后文本（可直接写入 ``gpt5.2/``，与旧版等价）。
-    raw_response : str
-        GPT 原始回复（含 ``<|ok|>`` 占位符，写入 ``gpt5.2-raw/``）。
-    n_segments : int
-        总段落数（含 image 段）。
-    n_sent : int
-        实际发送给 GPT 的段落数（不含 image 段）。
-    n_ok : int
-        GPT 认为无需修改的段落数。
-    n_image_skipped : int
-        自动跳过的 image 段数量。
-    """
-
     corrected: str
     raw_response: str
     n_segments: int = 0
@@ -108,20 +98,11 @@ def _encode_image(image_path: str | Path) -> str:
 
 
 def _parse_segments(ocr_text: str) -> list[Segment]:
-    """将 OCR 文本按 ``<|ref|>/<|det|>`` 标签切分为段落列表。
-
-    ``re.split`` with a capturing group returns::
-
-        [preamble, header₁, body₁, header₂, body₂, …]
-
-    前导文本（preamble）如果非空也会产生一个 ``header=""`` 的段落。
-    """
     parts = _REF_DET_RE.split(ocr_text)
     segments: list[Segment] = []
     idx = 1
     i = 0
 
-    # 处理可能存在的前导文本
     if parts and not _REF_DET_RE.match(parts[0]):
         if parts[0].strip():
             segments.append(Segment(index=idx, header="", body=parts[0]))
@@ -144,35 +125,21 @@ def _parse_segments(ocr_text: str) -> list[Segment]:
 def _format_segments_for_prompt(
     segments: list[Segment],
 ) -> tuple[str, dict[int, int]]:
-    """将 **非 image** 段落格式化为 ``[N type]`` 编号文本，供 GPT 审阅。
-
-    只发送类型标签（如 ``text`` / ``equation``），**不暴露坐标**，
-    杜绝 GPT 误改坐标的风险。
-
-    Returns
-    -------
-    formatted : str
-        带 ``[N type]`` 编号的段落文本。
-    gpt_to_abs : dict[int, int]
-        ``{GPT 编号 → 绝对 segment.index}`` 映射表，
-        用于将 GPT 回复映射回原始段落。
-    """
     lines: list[str] = []
     gpt_to_abs: dict[int, int] = {}
     gpt_idx = 1
 
     for seg in segments:
         if seg.is_image:
-            continue  # 跳过 image 段，不发送给 GPT
+            continue
 
         gpt_to_abs[gpt_idx] = seg.index
 
-        # [N type] 格式：紧凑且信息完整
         type_label = seg.ref_type
         tag = f"[{gpt_idx} {type_label}]" if type_label else f"[{gpt_idx}]"
         lines.append(tag)
         lines.append(seg.body.strip())
-        lines.append("")  # 空行分隔
+        lines.append("")
 
         gpt_idx += 1
 
@@ -180,13 +147,6 @@ def _format_segments_for_prompt(
 
 
 def _parse_gpt_response(response: str) -> dict[int, str]:
-    """解析 GPT 回复中的 ``[N]`` 或 ``[N type]`` 块。
-
-    Returns
-    -------
-    dict[int, str]
-        ``{GPT 编号: 校正内容 或 '<|ok|>'}``
-    """
     markers = list(_SEG_NUM_RE.finditer(response))
     corrections: dict[int, str] = {}
 
@@ -200,30 +160,47 @@ def _parse_gpt_response(response: str) -> dict[int, str]:
     return corrections
 
 
+def _apply_search_replace(original_body: str, corr_content: str, seg_idx: int) -> str:
+    """在段落原文中应用 `<<<< ==== >>>>` 替换块。"""
+    blocks = _SEARCH_REPLACE_RE.findall(corr_content)
+    new_body = original_body
+    
+    for search_text, replace_text in blocks:
+        # 宽容处理：防止开头结尾有多余换行导致匹配失败
+        search_target = search_text
+        if search_target not in new_body:
+            # 尝试 strip 后匹配
+            if search_target.strip() in new_body:
+                search_target = search_target.strip()
+                replace_text = replace_text.strip()
+            else:
+                print(f"Warning: [GPT 校正] 在段落 [{seg_idx}] 中无法定位替换块:\n{search_target[:50]}...")
+                continue
+        
+        # 只替换第一次出现（保证安全）
+        new_body = new_body.replace(search_target, replace_text, 1)
+
+    return new_body
+
+
 def _reassemble(
     ocr_text: str,
     segments: list[Segment],
     corrections: dict[int, str],
 ) -> str:
-    """将 GPT 校正结果合并回原始文本。
-
-    * image 段 → 原封不动保留
-    * ``<|ok|>`` → 保留原文
-    * 其他 → 替换 body，保留 header 与原始空白
-    """
+    """将 GPT 校正结果合并回原始文本。"""
     result = ocr_text
 
     for seg in segments:
         if seg.is_image:
-            continue  # image 段从未发给 GPT，跳过
+            continue
 
         corr = corrections.get(seg.index)
         if corr is None or corr.strip() == OK_PLACEHOLDER:
-            continue  # 原文不动
+            continue
 
         old_full = seg.full
 
-        # 保留 body 的前导换行
         leading_ws = ""
         for ch in seg.body:
             if ch in ("\n", "\r"):
@@ -231,11 +208,19 @@ def _reassemble(
             else:
                 break
 
-        # 保留 body 的尾部空白（段间间距）
         body_rstripped = seg.body.rstrip()
         trailing_ws = seg.body[len(body_rstripped):]
 
-        new_full = seg.header + leading_ws + corr.strip() + trailing_ws
+        # 判断 GPT 是用了替换块，还是重写了整段
+        if "<<<<" in corr and "====" in corr and ">>>>" in corr:
+            # 局部替换模式
+            modified_body = _apply_search_replace(seg.body, corr, seg.index)
+            # 替换后维持原有前导和尾部空白
+            new_full = seg.header + leading_ws + modified_body.strip() + trailing_ws
+        else:
+            # 全文重写模式 (Fallback)
+            new_full = seg.header + leading_ws + corr.strip() + trailing_ws
+            
         result = result.replace(old_full, new_full, 1)
 
     return result
@@ -246,39 +231,54 @@ def _reassemble(
 # ╚══════════════════════════════════════════════════════════════╝
 
 _CORRECTION_PROMPT_TEMPLATE = r"""# Role
-你是一位精通学术文档排版与 OCR 后处理的专家。
-
+你是一位精通学术文档 OCR 的**审校员**。你的职责是确保 OCR 结果在**内容上和科学上**的准确性，同时**尊重并保留原文的排版风格**。
 # Task
-下面是 OCR 引擎从一张文档图片中识别出的结果，已按段落编号，格式为 `[N type]`。
-- `N` 是段落编号
-- `type` 是段落类型（如 text / equation / table / figure_title 等）
-- 纯图片区域（`image` 类型）已被过滤，不在下方列表中。
+下面是 OCR 引擎识别出的段落，请逐段检查并修正。
 
-请逐段检查并校正。
+## 修正原则与禁区
+### 你需要修正的：
+1.  **明显拼写错误**：例如 OCR 识别混淆（`rn` ↔ `m`, `l` ↔ `1`, `O` ↔ `0`, `v` ↔ `y` ↔ `w`）。
+2.  **严重损坏的 LaTeX**：例如括号不匹配、命令拼写错误。
+3.  **明显的标点/语法错误**：影响句子理解的错误。
+
+### 【重要】你绝对不能做的（保持风格，避免过度修正）：
+1.  **禁止 LaTeX 化**：对于单位和化学式，如果原文可读，**绝对不要**画蛇添足地添加 `\mathrm` 或复杂的 LaTeX 命令。
+    -   **示例**：`CaCO_{{3}}` 是正确的，**无需**改为 `\mathrm{{CaCO}}_{{3}}`。
+2.  **禁止 Unicode 降级**：根据“以图像为准”的原则，如果图像中是 `m²`, `°C`, `μm`，那么它们就是**绝对正确**的。**严禁**因为参考文本是 `m2`, `C`, `um` 就进行降级修正。
+3.  **忽略微小空格**：如果空格差异不影响数学或化学公式的含义，则**无需修正**。专注于实质性错误。
 
 # Rules
-1. **【最高优先级】** 若输入内容**完全正确且无需修改**，你**必须且只能**输出：`<|ok|>`；**禁止**复述/重写任何原文（用于节省 Token）。
-2. 如果某段需要修正，请输出修正后的 **完整段落内容**（仅内容，不含 `[N type]` 标签头）。
-3. 修正范围包括：
-   - 拼写错误（OCR 常见混淆：l ↔ 1, rn ↔ m, O ↔ 0 等）
-   - 标点符号
-   - LaTeX 公式语法（上下标 `^` `_`、括号配对、命令拼写等）
-4. 保留 HTML 表格结构（`<table>`, `<tr>` 等）不变。
-5. **严格按照 `[N]` 编号逐段输出**，不要遗漏或增添编号。
+1. **【最高优先级】** 若某段内容**完全正确**（根据上述原则），你**必须且只能**输出：`<|ok|>`。
+2. **【局部修改】** 若只有少许错误，请使用**搜索替换块**。这是最快的方式。
+   - **上块 (<<<<):** 必须从原文中**一字不差地复制**出包含错误的**最短片段**。
+     - **要点1 (精确):** 包含所有原始空格和换行，否则程序会自动替换失败。
+     - **要点2 (简短):** 只需保留错误处前后几个词作为上下文，严禁抄写长句。
+     - **要点3 (禁止):** 绝对禁止使用 `...` 省略号。
+   - **下块 (====):** 填写修正后的文本。
+3. **【全文重写】** 只有当段落乱码严重、结构完全崩坏时，才直接输出整段修正文本。
+4.  保留 HTML 表格结构不变。
+5.  严格按照 `[N]` 编号逐段输出。
 
-# OCR Segments (image 段已过滤)
+# OCR Segments
 
 {numbered_segments}
 
-# Reference (PDF 直接提取的文字，仅供参考)
+# Reference (PDF直接提取的文字，仅作拼写校对辅助)
 
 {extracted_text}
 
 # Output Format
-严格按编号输出，每段一个 `[N]`，后跟 `<|ok|>` 或校正后的完整段落内容。示例：
+严格按编号输出，每段一个 `[N]`，后接 `<|ok|>`，或者替换块，或者全段内容。示例：
 
 [1] <|ok|>
-[2] This is the corrected paragraph content...
+
+[2]
+<<<<
+Thls is a wrang sentence.
+====
+This is a wrong sentence.
+>>>>
+
 [3] <|ok|>"""
 
 
@@ -296,54 +296,16 @@ def run_gpt_correction(
     model: str = "gpt-5.2",
     temperature: float = 1.0,
 ) -> CorrectionResult:
-    """使用多模态 LLM 对 OCR 结果进行分段校正。
-
-    ``<|ref|>image<|/ref|>`` 段自动跳过，不发送给 GPT。
-    只发送类型标签，不暴露坐标，杜绝误改风险。
-
-    Parameters
-    ----------
-    ocr_result : str
-        DeepSeek OCR 原始输出。
-    image_path : path-like
-        对应页面图片路径。
-    extracted_text : str
-        PDF 内嵌文本（辅助校正参考）。
-    api_key : str
-        API Key。
-    endpoint : str
-        API endpoint / base_url。
-    model : str
-        模型名称。
-    temperature : float
-        采样温度。
-
-    Returns
-    -------
-    CorrectionResult
-        ``.corrected``    — 校正后完整文本（写入 ``gpt5.2/``）
-        ``.raw_response`` — GPT 原始回复（写入 ``gpt5.2-raw/``）
-    """
-    # 0. 空输入保护
     if not ocr_result.strip():
-        return CorrectionResult(
-            corrected=ocr_result,
-            raw_response="",
-        )
+        return CorrectionResult(corrected=ocr_result, raw_response="")
 
-    # 1. 分段
     segments = _parse_segments(ocr_result)
-
     if not segments:
-        return CorrectionResult(
-            corrected=ocr_result,
-            raw_response="",
-        )
+        return CorrectionResult(corrected=ocr_result, raw_response="")
 
     n_image = sum(1 for s in segments if s.is_image)
     non_image = [s for s in segments if not s.is_image]
 
-    # 如果全部都是 image 段，无需调用 GPT
     if not non_image:
         return CorrectionResult(
             corrected=ocr_result,
@@ -354,14 +316,12 @@ def run_gpt_correction(
             n_image_skipped=n_image,
         )
 
-    # 2. 构建 prompt（image 段已过滤，坐标不暴露）
     numbered_text, gpt_to_abs = _format_segments_for_prompt(segments)
     prompt = _CORRECTION_PROMPT_TEMPLATE.format(
         numbered_segments=numbered_text,
         extracted_text=extracted_text or "(无)",
     )
 
-    # 3. 调用 GPT
     client = OpenAI(base_url=endpoint, api_key=api_key)
     image_base64 = _encode_image(image_path)
 
@@ -386,7 +346,6 @@ def run_gpt_correction(
 
     raw_response = response.choices[0].message.content
 
-    # 4. 解析回复 — GPT 编号 → 绝对 segment index
     gpt_corrections = _parse_gpt_response(raw_response)
     corrections: dict[int, str] = {}
     for gpt_idx, content in gpt_corrections.items():
@@ -394,10 +353,8 @@ def run_gpt_correction(
         if abs_idx is not None:
             corrections[abs_idx] = content
 
-    # 5. 合并
     corrected = _reassemble(ocr_result, segments, corrections)
 
-    # 6. 统计
     n_ok = sum(1 for v in corrections.values() if v.strip() == OK_PLACEHOLDER)
 
     return CorrectionResult(
