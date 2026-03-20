@@ -182,6 +182,7 @@ def run_pipeline_vllm(
     ds_batch_size: int = 1,
     gpt_model: str = "gpt-5.2",
     gpt_temperature: float = 1.0,
+    gpt_max_workers: int = 8,
     merge_markdown: bool = True,
     merged_filename: str = "ocr.md",
 ) -> Path:
@@ -317,6 +318,7 @@ def run_pipeline_vllm(
                 gpt_endpoint,
                 model=gpt_model,
                 temperature=gpt_temperature,
+                max_workers=gpt_max_workers,
             )
             gpt_output.write_text(result.corrected, encoding="utf-8")
             gpt_raw.write_text(result.raw_response, encoding="utf-8")
@@ -384,6 +386,7 @@ def run_pipeline_vllm(
     print(f"  GPT校正结果:    {gpt_dir}")
     print(f"  最终输出:       {output_dir}")
     print(f"  OCR 批大小:     {ds_batch_size}")
+    print(f"  GPT 并行数:     {gpt_max_workers}")
     print(f"\n每个页面的输出包括:")
     print(f"  - result.md:             处理后的markdown文件(带图片引用)")
     print(f"  - result_with_boxes.jpg: 带可视化边框的图片")
