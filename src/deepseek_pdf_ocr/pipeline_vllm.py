@@ -94,6 +94,7 @@ def _split_batch_response(text: str, expected: int) -> list[str]:
 
     return [segments.get(i, "") for i in range(1, expected + 1)]
 
+from deepseek_pdf_ocr.ocr import DEFAULT_OCR_PROMPT
 
 def _run_batch_ocr(
     page_nums: Sequence[int],
@@ -104,6 +105,7 @@ def _run_batch_ocr(
     base_url: str,
     model: str,
     batch_size: int,
+    prompt: str | None = None,
 ) -> None:
     """OCR pages in batches via the vLLM OpenAI-compatible endpoint.
 
@@ -135,7 +137,7 @@ def _run_batch_ocr(
 
         # Build multi-image content for the OpenAI-style API
         content: list[dict] = [
-            {"type": "text", "text": "Convert the document to markdown."},
+            {"type": "text", "text": prompt or DEFAULT_OCR_PROMPT},
         ]
         for pn in batch:
             b64 = _encode_image_b64(images_dir / f"{pn}.png")

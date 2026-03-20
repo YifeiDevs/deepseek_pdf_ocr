@@ -4,6 +4,7 @@ import base64
 from pathlib import Path
 from openai import OpenAI
 
+DEFAULT_OCR_PROMPT = "Convert to Markdown."
 
 def _encode_image(image_path: str | Path) -> str:
     """将图像文件编码为 base64 字符串。"""
@@ -16,6 +17,7 @@ def run_deepseek_ocr(
     api_key: str,
     base_url: str,
     model: str = "deepseek-ocr-2",
+    prompt: str | None = None,
 ) -> str:
     """使用 DeepSeek OCR-2 对单张图片进行 OCR。
 
@@ -44,7 +46,7 @@ def run_deepseek_ocr(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Convert the document to markdown."},
+                    {"type": "text", "text": prompt or DEFAULT_OCR_PROMPT},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{image_base64}"},
