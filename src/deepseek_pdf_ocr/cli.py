@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--dpi", type=int, default=300, help="PDF 渲染 DPI")
     parser.add_argument("--ds-model", default="deepseek-ocr-2", help="DeepSeek OCR 模型名")
-    parser.add_argument("--gpt-model", default="gpt-5.2", help="GPT 校正模型名")
+    parser.add_argument("--gpt-model", default="gpt-5.4", help="GPT 校正模型名")
     parser.add_argument("--gpt-temperature", type=float, default=1.0, help="GPT 采样温度")
     parser.add_argument(
         "--no-merge-markdown",
