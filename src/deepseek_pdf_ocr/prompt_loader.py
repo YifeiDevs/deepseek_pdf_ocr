@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64,json,mimetypes
+import base64, json, mimetypes
 from copy import deepcopy
 from pathlib import Path
 
@@ -15,7 +15,11 @@ def load_markdown_messages(path: str | Path, dump_json: str | Path | None = None
     src = path.read_text(encoding="utf-8")
     lines = src.splitlines(keepends=True)
     tokens = MarkdownIt("commonmark").parse(src)
-    content, i = [], 0
+    
+    messages = []
+    content = []
+    current_role = "user"  # 默认角色：如果不使用任何标题，所有内容默认视为 user
+    i = 0
 
     def add_text(text: str):
         text = text.strip()
@@ -31,6 +35,26 @@ def load_markdown_messages(path: str | Path, dump_json: str | Path | None = None
 
         if t.type in {"paragraph_open", "heading_open"} and i + 1 < len(tokens) and tokens[i + 1].type == "inline":
             inline = tokens[i + 1]
+            
+            # 【新增逻辑】拦截 Markdown 标题，判断是否为角色切换标签
+            if t.type == "heading_open":
+                heading_text = inline.content.strip().lower()
+                # 兼容常见称呼，例如 user, assistant, system, model
+                if heading_text in {"user", "assistant", "system", "model"}:
+                    # 统一下划线命名：通常大模型 API 使用 assistant 而不是 model
+                    role = "assistant" if heading_text == "model" else heading_text
+                    
+                    # 如果当前已经积累了内容，就将其结算为上一个角色的一条 message
+                    if content:
+                        messages.append({"role": current_role, "content": content})
+                        content = []
+                    
+                    # 切换当前角色，并跳过这行标题文字（不存入发送给大模型的正文）
+                    current_role = role
+                    i += 3  # 跳过 heading_open -> inline -> heading_close
+                    continue
+
+            # 处理图片和常规文本
             img = next((c.attrGet("src") for c in (inline.children or []) if c.type == "image"), None)
 
             if img:
@@ -63,7 +87,9 @@ def load_markdown_messages(path: str | Path, dump_json: str | Path | None = None
 
         i += 1
 
-    messages = [{"role": "user", "content": content}] if content else []
+    # 【新增逻辑】收尾：将最后一次积累的内容存入 messages
+    if content:
+        messages.append({"role": current_role, "content": content})
 
     if dump_json:
         Path(dump_json).write_text(
@@ -72,6 +98,7 @@ def load_markdown_messages(path: str | Path, dump_json: str | Path | None = None
         )
 
     return messages
+
 
 def print_messages(msgs):
     msgs = deepcopy(msgs)
@@ -93,6 +120,7 @@ def print_messages(msgs):
             rows.append(f'    {{"type": {t},{(w - len(t) + 1) * " "}{d(k)}: {d(x[k])}}}')
         out.append(f'{{"role": {d(m.get("role"))},"content": [\n' + ",\n".join(rows) + "\n]}")
     print("[" + ",\n ".join(out) + "]")
+
 
 if __name__ == "__main__":
     md_path = (Path(__file__).resolve().parent / "../../examples.md").resolve()
