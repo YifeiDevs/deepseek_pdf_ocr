@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Sequence
 from openai import OpenAI
 from tqdm import tqdm
-# ── Reuse utilities from the original pipeline & sister modules ──
 from deepseek_pdf_ocr.pdf_utils import (
     pdf_to_images,
     extract_text_from_pdf,
@@ -23,53 +22,33 @@ from deepseek_pdf_ocr.correction import run_gpt_correction
 from deepseek_pdf_ocr.post_process import process_single_page
 from deepseek_pdf_ocr.merge_markdown import merge_page_markdowns
 from deepseek_pdf_ocr.pipeline import _format_duration, _print_timing_report
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Internal helpers                                            ║
-# ╚══════════════════════════════════════════════════════════════╝
+
+# ... 【_encode_image_b64, _split_batch_response, _run_batch_ocr 函数保持原样，未做修改】...
+
 def _encode_image_b64(path: str | Path) -> str:
-    """Read an image file and return its base64-encoded string."""
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
-# Matches ``<!-- image N -->`` headers emitted by ``ocr_api_server_vllm``
+
 _IMAGE_MARKER_RE = re.compile(r"<!--\s*image\s+(\d+)\s*-->")
+
 def _split_batch_response(text: str, expected: int) -> list[str]:
-    """Split a combined multi-image response into *expected* individual results.
-    ``ocr_api_server_vllm`` formats multi-image results as::
-        <!-- image 1 -->
-        …per-page OCR content…
-        ---
-        <!-- image 2 -->
-        …per-page OCR content…
-    Single-image responses contain **no** markers and are returned as-is.
-    Parameters
-    ----------
-    text : str
-        Raw ``response.choices[0].message.content``.
-    expected : int
-        Number of images that were sent in the batch.
-    Returns
-    -------
-    list[str]
-        A list of length *expected*; missing entries are empty strings.
-    """
     if expected <= 1:
         return [text.strip()]
     markers = list(_IMAGE_MARKER_RE.finditer(text))
     if not markers:
-        # Fallback: server returned plain text without markers
         return [text.strip()] + [""] * (expected - 1)
-    # Build {1-based image index → content} mapping
     segments: dict[int, str] = {}
     for i, m in enumerate(markers):
         idx = int(m.group(1))
         start = m.end()
         end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
         chunk = text[start:end]
-        # Strip the trailing ``\n\n---\n\n`` separator between images
         chunk = re.sub(r"\s*---\s*$", "", chunk)
         segments[idx] = chunk.strip()
     return [segments.get(i, "") for i in range(1, expected + 1)]
+
 from deepseek_pdf_ocr.ocr import DEFAULT_OCR_PROMPT
+
 def _run_batch_ocr(
     page_nums: Sequence[int],
     images_dir: Path,
@@ -81,12 +60,7 @@ def _run_batch_ocr(
     batch_size: int,
     prompt: str | None = None,
 ) -> None:
-    """OCR pages in batches via the vLLM OpenAI-compatible endpoint.
-    Pages whose output (``ocr_dir/page-{N}.md``) already exists are
-    automatically skipped.
-    """
     client = OpenAI(api_key=api_key, base_url=base_url)
-    # ── filter out already-completed pages ──
     todo: list[int] = []
     for pn in page_nums:
         if (ocr_dir / f"page-{pn}.md").exists():
@@ -96,7 +70,6 @@ def _run_batch_ocr(
     if not todo:
         print("  所有页面 OCR 结果已存在，跳过。")
         return
-    # ── send images in batches ──
     n_batches = (len(todo) + batch_size - 1) // batch_size
     for bi in tqdm(
         range(0, len(todo), batch_size),
@@ -104,7 +77,6 @@ def _run_batch_ocr(
         total=n_batches,
     ):
         batch = todo[bi : bi + batch_size]
-        # Build multi-image content for the OpenAI-style API
         content: list[dict] = [
             {"type": "text", "text": prompt or DEFAULT_OCR_PROMPT},
         ]
@@ -131,9 +103,7 @@ def _run_batch_ocr(
         except Exception as exc:
             for pn in batch:
                 print(f"  ✗ 第 {pn} 页 OCR 失败: {exc}")
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Public API                                                  ║
-# ╚══════════════════════════════════════════════════════════════╝
+
 def run_pipeline_vllm(
     pdf_path: str | Path,
     ds_api_key: str,
@@ -150,67 +120,31 @@ def run_pipeline_vllm(
     merge_markdown: bool = True,
     merged_filename: str = "ocr.md",
 ) -> Path:
-    """Execute the full PDF OCR pipeline using the vLLM batch backend.
-    API-compatible with :func:`pipeline.run_pipeline`; the only addition
-    is *ds_batch_size*.
-    Parameters
-    ----------
-    pdf_path : path-like
-        输入 PDF 文件路径。
-    ds_api_key : str
-        DeepSeek OCR API Key。
-    ds_base_url : str
-        DeepSeek OCR API base URL。
-    gpt_api_key : str
-        GPT 校正 API Key。
-    gpt_endpoint : str
-        GPT 校正 API endpoint。
-    dpi : int
-        PDF 渲染 DPI。
-    ds_model : str
-        DeepSeek OCR 模型名称。
-    ds_batch_size : int
-        **每次 OCR 请求并行处理的页数**。
-        - ``1`` — 逐页发送，行为与 ``pipeline.run_pipeline`` 完全相同。
-        - ``> 1`` — 多张图片打包为一个请求，由 vLLM 引擎批量推理后
-          拆分回各页结果。值越大吞吐越高，但单次请求 payload 与延迟
-          也越大，请根据 GPU 显存和网络情况调整。
-    gpt_model : str
-        GPT 校正模型名称。
-    gpt_temperature : float
-        GPT 采样温度。
-    merge_markdown : bool
-        是否在 pipeline 结束后合并所有页的 result.md。
-    merged_filename : str
-        合并后的 Markdown 文件名（写入工作目录根）。
-    Returns
-    -------
-    Path
-        输出根目录 (``output_dir``)。
-    """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF文件不存在: {pdf_path}")
     timings: dict[str, float] = {}
     t_pipeline = time.perf_counter()
-    # ── Directory layout (identical to pipeline.py) ──
+
     base_dir = pdf_path.parent / pdf_path.stem
     images_dir = base_dir / "images_pages"
     text_dir = base_dir / "pdf_text"
     ocr_dir = base_dir / "deepseek-ocr-2"
     gpt_dir = base_dir / "gpt5.2"
     gpt_raw_dir = base_dir / "gpt5.2-raw"
-    # A/B subdirectories for side-by-side diff in VSCode
-    gpt_raw_a_dir = gpt_raw_dir / "A"   # OCR 原文（校正前）
-    gpt_raw_b_dir = gpt_raw_dir / "B"   # GPT 回复（校正内容）
+    gpt_raw_a_dir = gpt_raw_dir / "A"   
+    gpt_raw_b_dir = gpt_raw_dir / "B"   
+    gpt_summary_pages_dir = gpt_raw_dir / "summary_pages" # <-- 【新增】
     output_dir = base_dir / "output"
+
     for d in (
         base_dir, images_dir, text_dir, ocr_dir,
-        gpt_dir, gpt_raw_dir, gpt_raw_a_dir, gpt_raw_b_dir,
+        gpt_dir, gpt_raw_dir, gpt_raw_a_dir, gpt_raw_b_dir, gpt_summary_pages_dir,
         output_dir,
     ):
         d.mkdir(parents=True, exist_ok=True)
     num_pages = get_page_count(pdf_path)
+
     # ════════════ Step 1: PDF → 高清图像 ════════════
     print("=" * 60)
     print("Step 1: PDF 转高清图像")
@@ -222,6 +156,7 @@ def run_pipeline_vllm(
     else:
         num_pages = pdf_to_images(pdf_path, images_dir, dpi=dpi)
     timings["Step 1: PDF to Images"] = time.perf_counter() - t0
+
     # ════════════ Step 2: 提取 PDF 内嵌文本 ════════════
     print("\n" + "=" * 60)
     print("Step 2: 提取PDF内嵌文本")
@@ -232,6 +167,7 @@ def run_pipeline_vllm(
         (text_dir / f"page-{pn}-text.txt").write_text(txt, encoding="utf-8")
     print(f"✓ 已提取 {len(pdf_texts)} 页文本")
     timings["Step 2: Extract PDF Text"] = time.perf_counter() - t0
+
     # ════════════ Step 3: DeepSeek OCR (vLLM batch) ════════════
     print("\n" + "=" * 60)
     print(f"Step 3: DeepSeek OCR-2  (vLLM, batch_size={ds_batch_size})")
@@ -247,6 +183,7 @@ def run_pipeline_vllm(
         batch_size=ds_batch_size,
     )
     timings["Step 3: DeepSeek OCR (vLLM)"] = time.perf_counter() - t0
+
     # ════════════ Step 4: GPT 校正 ════════════
     print("\n" + "=" * 60)
     print("Step 4: GPT 校正")
@@ -255,7 +192,6 @@ def run_pipeline_vllm(
     for pn in tqdm(range(1, num_pages + 1), desc="GPT校正"):
         ocr_file = ocr_dir / f"page-{pn}.md"
         gpt_output = gpt_dir / f"page-{pn}.md"
-        # A = OCR 原文（校正前），B = GPT 回复（校正内容/理由）
         gpt_raw_a = gpt_raw_a_dir / f"page-{pn}.md"
         gpt_raw_b = gpt_raw_b_dir / f"page-{pn}.md"
         image_path = images_dir / f"{pn}.png"
@@ -279,10 +215,9 @@ def run_pipeline_vllm(
                 max_workers=gpt_max_workers,
             )
             gpt_output.write_text(result.corrected, encoding="utf-8")
-            # A: 有变化的 segment 写原文，<|ok|> 的写 <|ok|>（diff 左侧）
             gpt_raw_a.write_text(result.raw_a, encoding="utf-8")
-            # B: 有变化的 segment 写 GPT 回复，<|ok|> 的写 <|ok|>（diff 右侧）
             gpt_raw_b.write_text(result.raw_b, encoding="utf-8")
+            (gpt_summary_pages_dir / f"page-{pn}.md").write_text(result.summary, encoding="utf-8")  # <-- 【新增】
             print(
                 f"  ✓ 第 {pn} 页 GPT 校正完成"
                 f"  ({result.n_ok}/{result.n_sent} segments unchanged"
@@ -290,7 +225,25 @@ def run_pipeline_vllm(
             )
         except Exception as e:
             print(f"  ✗ 第 {pn} 页 GPT 校正失败: {e}")
+            
+    # ── 【新增】Step 4.5 汇总所有的 Markdown 差异表格 ──
+    summary_lines = ["# GPT Correction Summary\n"]
+    for pn in range(1, num_pages + 1):
+        summary_lines.append(f"## Page {pn}\n")
+        page_summary_file = gpt_summary_pages_dir / f"page-{pn}.md"
+        if page_summary_file.exists():
+            content = page_summary_file.read_text(encoding="utf-8").strip()
+            if content:
+                summary_lines.append(content + "\n")
+            else:
+                summary_lines.append("*No modifications*\n")
+        else:
+            summary_lines.append("*No summary available*\n")
+        summary_lines.append("\n---\n")
+    (gpt_raw_dir / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
+
     timings["Step 4: GPT Correction"] = time.perf_counter() - t0
+
     # ════════════ Step 5: 后处理 ════════════
     print("\n" + "=" * 60)
     print("Step 5: 后处理 (提取图片、绘制边框)")
@@ -315,6 +268,7 @@ def run_pipeline_vllm(
         except Exception as e:
             print(f"  ✗ 第 {pn} 页后处理失败: {e}")
     timings["Step 5: Post-processing"] = time.perf_counter() - t0
+
     # ════════════ Step 6: 合并 Markdown ════════════
     if merge_markdown:
         print("\n" + "=" * 60)
@@ -330,6 +284,7 @@ def run_pipeline_vllm(
             print(f"✗ 合并 Markdown 失败: {e}")
         timings["Step 6: Merge Markdown"] = time.perf_counter() - t0
     total_time = time.perf_counter() - t_pipeline
+
     # ── Summary ──
     print("\n" + "=" * 60)
     print("全部完成!")
@@ -342,6 +297,7 @@ def run_pipeline_vllm(
     print(f"  GPT校正结果:    {gpt_dir}")
     print(f"  GPT原始回复 A:  {gpt_raw_a_dir}  (OCR原文，diff左侧)")
     print(f"  GPT原始回复 B:  {gpt_raw_b_dir}  (GPT回复，diff右侧)")
+    print(f"  修改内容汇总:   {gpt_raw_dir / 'summary.md'}  (包含对比图片与前后文本)") # <-- 【新增】友好输出
     print(f"  最终输出:       {output_dir}")
     print(f"  OCR 批大小:     {ds_batch_size}")
     print(f"  GPT 并行数:     {gpt_max_workers}")

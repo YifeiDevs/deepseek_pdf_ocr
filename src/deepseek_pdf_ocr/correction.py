@@ -1,15 +1,4 @@
-"""GPT 校正：利用多模态 LLM 对 OCR 结果进行 **逐段** 纠错。
-v4 重构（按段裁图 + 并行）
--------
-- 每个非 image 的 segment，根据 <|det|> 坐标从整页大图中裁出对应小图
-- 多框 segment（如跨列文本：左下角一块 + 右上角一块）按坐标顺序各自裁剪，
-  依次传给 GPT，而不是合并成大框（合并会把两列之间的空白一起框进去）
-- 将「小图(s) + 该段 OCR 文本」发送给 GPT，聚焦视野，避免整页干扰
-- 多个 segment 并发请求（ThreadPoolExecutor），吞吐量与 DeepSeek 批处理相当
-- 去掉 extracted_text（Reference）：小段无法对齐，意义不大
-- GPT 只需直接输出修正后的文本，或输出 <|ok|> 表示无需修改
-- 保留 Search & Replace 语法以节省 output token（可选）
-"""
+# src/deepseek_pdf_ocr/correction.py
 from __future__ import annotations
 import base64
 import re
@@ -20,11 +9,7 @@ from pathlib import Path
 from openai import OpenAI
 from PIL import Image
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Constants                                                   ║
-# ╚══════════════════════════════════════════════════════════════╝
 OK_PLACEHOLDER = "<|ok|>"
-"""GPT 返回此占位符表示"该段无需修改"。" """
 
 _REF_DET_RE = re.compile(
     r"(<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>)", re.DOTALL
@@ -33,27 +18,20 @@ _IMAGE_REF_RE = re.compile(r"<\|ref\|>\s*image\s*<\|/ref\|>")
 _REF_TYPE_RE = re.compile(r"<\|ref\|>(.*?)<\|/ref\|>")
 _DET_COORDS_RE = re.compile(r"<\|det\|>(.*?)<\|/det\|>", re.DOTALL)
 
-# Search & Replace 块
 _SEARCH_REPLACE_RE = re.compile(
     r"<<<<\s*\n(.*?)\n\s*====\s*\n(.*?)\n\s*>>>>", re.DOTALL
 )
 
-# 归一化坐标范围（DeepSeek OCR 使用 0-999）
 _COORD_MAX = 999
-# 裁图时的外边距（像素），避免贴边
 _CROP_PADDING = 8
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Data structures                                             ║
-# ╚══════════════════════════════════════════════════════════════╝
 @dataclass
 class Segment:
     index: int
-    header: str       # <|ref|>...<|/ref|><|det|>...<|/det|>
-    body: str         # 段落文字内容
+    header: str       
+    body: str         
     is_image: bool = False
     coords: list[list[int]] = field(default_factory=list)
-    """所有检测框坐标列表，每项为 [x1, y1, x2, y2]（0-999 归一化）。"""
 
     @property
     def ref_type(self) -> str:
@@ -68,9 +46,10 @@ class Segment:
 @dataclass
 class CorrectionResult:
     corrected: str
-    raw_response: str          # 兼容旧字段，保留
-    raw_a: str = ""            # diff 左侧：修正前的原文
-    raw_b: str = ""            # diff 右侧：修正后的文本
+    raw_response: str          
+    raw_a: str = ""            
+    raw_b: str = ""            
+    summary: str = ""          # <-- 【新增】用于记录该页各段的对比表格
     n_segments: int = 0
     n_sent: int = 0
     n_ok: int = 0
@@ -80,20 +59,16 @@ class CorrectionResult:
     def n_corrected(self) -> int:
         return self.n_sent - self.n_ok
 
+# --- 其他内部函数保持原有内容不变 ---
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Internal helpers                                            ║
-# ╚══════════════════════════════════════════════════════════════╝
 def _parse_coords(header: str) -> list[list[int]]:
-    """从 header 中提取所有检测框坐标。"""
     m = _DET_COORDS_RE.search(header)
     if not m:
         return []
     try:
-        coords = eval(m.group(1).strip())  # noqa: S307
+        coords = eval(m.group(1).strip())
         if not coords:
             return []
-        # 支持单框 [[x1,y1,x2,y2]] 和多框 [[...],[...]]
         if isinstance(coords[0], int):
             return [coords]
         return [c for c in coords if isinstance(c, list) and len(c) == 4]
@@ -101,7 +76,6 @@ def _parse_coords(header: str) -> list[list[int]]:
         return []
 
 def _parse_segments(ocr_text: str) -> list[Segment]:
-    """将 OCR 文本按 ref/det 标签切分为 Segment 列表。"""
     parts = _REF_DET_RE.split(ocr_text)
     segments: list[Segment] = []
     idx = 1
@@ -135,11 +109,6 @@ def _crop_segment_images(
     coords: list[list[int]],
     padding: int = _CROP_PADDING,
 ) -> list[Image.Image]:
-    """根据归一化坐标从整页图像中裁剪出该段的所有检测框，按顺序返回。
-    多框情况（如跨列文本：左下角一块 + 右上角一块）不做合并，
-    而是按坐标列表顺序各自裁剪，由调用方按顺序传给 GPT。
-    这样 GPT 能分别看清每一块的实际内容，避免框选两列之间的空白区域。
-    """
     if not coords:
         return []
     W, H = page_image.size
@@ -155,13 +124,11 @@ def _crop_segment_images(
     return crops
 
 def _image_to_base64(img: Image.Image) -> str:
-    """PIL Image → base64 PNG 字符串。"""
     buf = BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def _apply_search_replace(original_body: str, corr_content: str, seg_idx: int) -> str:
-    """在段落原文中应用 `<<<< ==== >>>>` 替换块。"""
     blocks = _SEARCH_REPLACE_RE.findall(corr_content)
     new_body = original_body
     for search_text, replace_text in blocks:
@@ -184,7 +151,6 @@ def _reassemble(
     segments: list[Segment],
     corrections: dict[int, str],
 ) -> str:
-    """将 GPT 校正结果合并回原始文本。"""
     result = ocr_text
     for seg in segments:
         if seg.is_image:
@@ -214,9 +180,6 @@ def _reassemble(
 
     return result
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Prompt template（单段）                                     ║
-# ╚══════════════════════════════════════════════════════════════╝
 _SINGLE_SEG_PROMPT = r"""# Role
 你是一位精通学术文档 OCR 的**校对员**，任务是纠正 OCR 识别错误，而不是改写或美化文本。
 
@@ -258,9 +221,6 @@ _SINGLE_SEG_PROMPT = r"""# Role
 - 若段落严重损坏（大量字符错误），直接输出整段修正文本。
 """
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Single-segment GPT call                                     ║
-# ╚══════════════════════════════════════════════════════════════╝
 def _correct_one_segment(
     seg: Segment,
     crop_imgs: list[Image.Image],
@@ -269,21 +229,12 @@ def _correct_one_segment(
     model: str,
     temperature: float,
 ) -> tuple[int, str]:
-    """对单个 segment 调用 GPT，返回 (seg.index, corrected_text)。
-    多框 segment（如跨列文本）按坐标顺序发送多张裁剪图：
-      - 第 1 张图 = 第 1 个检测框的裁剪区域
-      - 第 2 张图 = 第 2 个检测框的裁剪区域（如右列续文）
-      - ……
-    GPT 依次看到各块后结合 OCR 文本进行校正。
-    若无法裁图（坐标缺失）则回退到整页图。
-    """
     prompt = (
         _SINGLE_SEG_PROMPT
         .replace("<|ref_type|>", seg.ref_type or "text")
         .replace("<|ocr_text|>", seg.body.strip())
     )
 
-    # 构建 content：先放 prompt 文字，再按顺序放裁剪图（或整页图兜底）
     content: list[dict] = [{"type": "text", "text": prompt}]
     if crop_imgs:
         for img in crop_imgs:
@@ -296,7 +247,6 @@ def _correct_one_segment(
                 }
             )
     else:
-        # 没有坐标信息，回退到整页图
         content.append(
             {
                 "type": "image_url",
@@ -314,21 +264,17 @@ def _correct_one_segment(
 
     return seg.index, response.choices[0].message.content
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  Public API                                                  ║
-# ╚══════════════════════════════════════════════════════════════╝
+
 def run_gpt_correction(
     ocr_result: str,
     image_path: str | Path,
-    extracted_text: str,          # 保留参数签名兼容性，不再使用
+    extracted_text: str,          
     api_key: str,
     endpoint: str,
     model: str = "gpt-5.2",
     temperature: float = 1.0,
     max_workers: int = 8,
 ) -> CorrectionResult:
-    """对整页 OCR 结果按 segment 并发校正。"""
-
     if not ocr_result.strip():
         return CorrectionResult(corrected=ocr_result, raw_response="")
 
@@ -349,17 +295,14 @@ def run_gpt_correction(
             n_image_skipped=n_image,
         )
 
-    # 加载整页图像（用于裁剪）
     page_image = Image.open(image_path).convert("RGB")
     client = OpenAI(base_url=endpoint, api_key=api_key)
 
-    # 预裁剪所有 segment 的小图列表（多框时保留多张，顺序与坐标列表一致）
     crops: dict[int, list[Image.Image]] = {
         seg.index: _crop_segment_images(page_image, seg.coords)
         for seg in non_image
     }
 
-    # 并发请求 GPT
     corrections: dict[int, str] = {}
     raw_parts: list[str] = []
 
@@ -385,7 +328,6 @@ def run_gpt_correction(
                 raw_parts.append(f"[{idx}] {content}")
             except Exception as exc:
                 print(f"  Warning: segment [{seg.index}] GPT 校正失败: {exc}")
-                # 失败时保留原文（等同于 <|ok|>）
                 corrections[seg.index] = OK_PLACEHOLDER
                 raw_parts.append(f"[{seg.index}] (error: {exc})")
 
@@ -393,22 +335,18 @@ def run_gpt_correction(
     n_ok = sum(1 for v in corrections.values() if v.strip() == OK_PLACEHOLDER)
 
     # =========================================================================
-    # 按 segment index 顺序生成 A/B diff 文件内容
-    # A 侧：修正前的原文
-    # B 侧：修正后的文本
-    # 策略：
-    # - 若完全没有修改（GPT返回 <|ok|>，或替换内容完全没变），两边都写入 <|same|>
-    # - 若发生了实际修改，A写更正前，B写更正后的【最终实际文本】（应用替换后）
+    # 按 segment index 顺序生成 A/B diff 文件内容 以及 summary 的 Markdown 差异表格
     # =========================================================================
     seg_by_idx = {s.index: s for s in segments}
     all_indices = sorted(seg_by_idx.keys())
+    
     a_parts: list[str] = []
     b_parts: list[str] = []
+    summary_parts: list[str] = []   # <-- 【新增】收集不同的部分，带有原图裁剪 HTML
 
     for idx in all_indices:
         seg = seg_by_idx[idx]
         
-        # 1. Image 占位，直接跳过
         if seg.is_image:
             a_parts.append(f"[{idx}]\n(image, skipped)")
             b_parts.append(f"[{idx}]\n(image, skipped)")
@@ -418,7 +356,6 @@ def run_gpt_correction(
         is_ok = gpt_reply.strip() == OK_PLACEHOLDER
         original_text = seg.body.strip()
 
-        # 2. 计算修正后的最终文本
         if is_ok:
             corrected_text = original_text
         elif "<<<<" in gpt_reply and "====" in gpt_reply and ">>>>" in gpt_reply:
@@ -426,13 +363,10 @@ def run_gpt_correction(
         else:
             corrected_text = gpt_reply.strip()
 
-        # 3. 比较差异并写入 A/B (区分 <|ok|> 和 <|same|>)
         if is_ok:
-            # GPT 明确认为不需要修改，返回了 <|ok|>
             a_parts.append(f"[{idx}]\n<|ok|>")
             b_parts.append(f"[{idx}]\n<|ok|>")
         elif original_text == corrected_text:
-            # GPT 输出了修正内容（或替换块），但应用后与原文一模一样
             a_parts.append(f"[{idx}]\n<|same|>")
             b_parts.append(f"[{idx}]\n<|same|>")
         else:
@@ -440,17 +374,60 @@ def run_gpt_correction(
             a_parts.append(f"[{idx}]\n{original_text}")
             b_parts.append(f"[{idx}]\n{corrected_text}")
 
+            # ======= 【新增】构建不同内容的 HTML 图片追踪以及 Markdown 表格 =======
+            img_tags = []
+            img_filename = Path(image_path).name
+            W, H = page_image.size
+
+            if not seg.coords:
+                # 缺失坐标，直接引入整图
+                img_tags.append(
+                    f'<img src="../images_pages/{img_filename}" style="width: 100%; max-width: {W}px; height: auto;">'
+                )
+            else:
+                for c in seg.coords:
+                    x1 = max(0, int(c[0] / _COORD_MAX * W) - _CROP_PADDING)
+                    y1 = max(0, int(c[1] / _COORD_MAX * H) - _CROP_PADDING)
+                    x2 = min(W, int(c[2] / _COORD_MAX * W) + _CROP_PADDING)
+                    y2 = min(H, int(c[3] / _COORD_MAX * H) + _CROP_PADDING)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    w_px = x2 - x1
+                    h_px = y2 - y1
+                    
+                    # 【核心修复】：由于 object-fit: none 拒绝缩放，过宽的图在 PDF 会被截断。
+                    # 设定一个安全的 A4 PDF 阅读宽度 (如 700px)。如果裁剪视口超过这个宽度，
+                    # 我们利用 zoom 按比例整体缩放这个 HTML 元素，完美适应页面！
+                    MAX_WIDTH = 700
+                    scale = min(1.0, MAX_WIDTH / w_px) if w_px > 0 else 1.0
+                    zoom_style = f" zoom: {scale:.3f};" if scale < 1.0 else ""
+                    
+                    # 注意必须加上 max-width: none; 防止被 Markdown 默认的 img { max-width: 100%; } 提前裁切
+                    img_tags.append(
+                        f'<img src="../images_pages/{img_filename}" style="width: {w_px}px; height: {h_px}px; object-fit: none; object-position: -{x1}px -{y1}px; max-width: none;{zoom_style}">'
+                    )
+            
+            # 安全转义字符供在 Markdown Table 内多行使用
+            def esc(txt: str) -> str:
+                txt = txt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                return txt.replace("|", "&#124;").replace("\n", "<br>")
+            
+            # 使用 Markdown 生成对比表格
+            summary_part = "\n".join(img_tags) + f"\n\n| Original | Modified |\n| --- | --- |\n| {esc(original_text)} | {esc(corrected_text)} |"
+            summary_parts.append(summary_part)
+
     sep = "\n---\n"
     raw_a = sep.join(a_parts)
     raw_b = sep.join(b_parts)
-    # raw_response 保持旧格式兼容
     raw_response = sep.join(sorted(raw_parts))
+    summary_md = "\n\n---\n\n".join(summary_parts) if summary_parts else ""
 
     return CorrectionResult(
         corrected=corrected,
         raw_response=raw_response,
         raw_a=raw_a,
         raw_b=raw_b,
+        summary=summary_md,          # <-- 【新增】
         n_segments=len(segments),
         n_sent=len(non_image),
         n_ok=n_ok,

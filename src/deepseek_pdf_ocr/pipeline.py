@@ -1,3 +1,4 @@
+# src/deepseek_pdf_ocr/pipeline.py
 """主 pipeline：串联 PDF 解析 → OCR → 校正 → 后处理全流程。"""
 from __future__ import annotations
 import time
@@ -8,8 +9,8 @@ from deepseek_pdf_ocr.ocr import run_deepseek_ocr
 from deepseek_pdf_ocr.correction import run_gpt_correction
 from deepseek_pdf_ocr.post_process import process_single_page
 from deepseek_pdf_ocr.merge_markdown import merge_page_markdowns
+
 def _format_duration(seconds: float) -> str:
-    """Format seconds into a human-readable duration string."""
     if seconds < 60:
         return f"{seconds:.2f}s"
     minutes, secs = divmod(seconds, 60)
@@ -17,8 +18,8 @@ def _format_duration(seconds: float) -> str:
         return f"{int(minutes)}m {secs:.2f}s"
     hours, minutes = divmod(int(minutes), 60)
     return f"{int(hours)}h {int(minutes)}m {secs:.2f}s"
+
 def _print_timing_report(timings: dict[str, float], total_time: float) -> None:
-    """Print a nicely aligned timing report after the pipeline finishes."""
     print("\n" + "=" * 70)
     print("  Timing Report")
     print("=" * 70)
@@ -42,6 +43,7 @@ def _print_timing_report(timings: dict[str, float], total_time: float) -> None:
         f"  100.0%"
     )
     print("=" * 70)
+
 def run_pipeline(
     pdf_path: str | Path,
     ds_api_key: str,
@@ -56,60 +58,31 @@ def run_pipeline(
     merge_markdown: bool = True,
     merged_filename: str = "ocr.md",
 ) -> Path:
-    """执行完整的 PDF OCR pipeline。
-    Parameters
-    ----------
-    pdf_path : path-like
-        输入 PDF 文件路径。
-    ds_api_key : str
-        DeepSeek OCR API Key。
-    ds_base_url : str
-        DeepSeek OCR API base URL。
-    gpt_api_key : str
-        GPT 校正 API Key。
-    gpt_endpoint : str
-        GPT 校正 API endpoint。
-    dpi : int
-        PDF 渲染 DPI。
-    ds_model : str
-        DeepSeek OCR 模型名称。
-    gpt_model : str
-        GPT 校正模型名称。
-    gpt_temperature : float
-        GPT 采样温度。
-    merge_markdown : bool
-        是否在 pipeline 结束后合并所有页的 result.md。
-    merged_filename : str
-        合并后的 Markdown 文件名（写入工作目录根，即 output 的父目录）。
-    Returns
-    -------
-    Path
-        输出根目录。
-    """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF文件不存在: {pdf_path}")
-    # ── Timers ──
     timings: dict[str, float] = {}
     pipeline_start = time.perf_counter()
-    # ── 目录结构 ──
+
     base_dir = pdf_path.parent / pdf_path.stem
     images_dir = base_dir / "images_pages"
     text_dir = base_dir / "pdf_text"
     ocr_dir = base_dir / "deepseek-ocr-2"
     gpt_dir = base_dir / "gpt5.2"
     gpt_raw_dir = base_dir / "gpt5.2-raw"
-    # A/B subdirectories for side-by-side diff in VSCode
-    gpt_raw_a_dir = gpt_raw_dir / "A"   # OCR 原文（校正前）
-    gpt_raw_b_dir = gpt_raw_dir / "B"   # GPT 回复（校正内容）
+    gpt_raw_a_dir = gpt_raw_dir / "A"   
+    gpt_raw_b_dir = gpt_raw_dir / "B"   
+    gpt_summary_pages_dir = gpt_raw_dir / "summary_pages" # <-- 【新增】摘要按页保存缓存文件夹
     output_dir = base_dir / "output"
+
     for d in [
         base_dir, images_dir, text_dir, ocr_dir,
-        gpt_dir, gpt_raw_dir, gpt_raw_a_dir, gpt_raw_b_dir,
+        gpt_dir, gpt_raw_dir, gpt_raw_a_dir, gpt_raw_b_dir, gpt_summary_pages_dir,
         output_dir,
     ]:
         d.mkdir(parents=True, exist_ok=True)
     num_pages = get_page_count(pdf_path)
+
     # ── Step 1: PDF → 高清图像 ──
     print("=" * 60)
     print("Step 1: PDF 转高清图像")
@@ -121,6 +94,7 @@ def run_pipeline(
     else:
         num_pages = pdf_to_images(pdf_path, images_dir, dpi=dpi)
     timings["Step 1: PDF to Images"] = time.perf_counter() - step_start
+
     # ── Step 2: 提取 PDF 文本 ──
     print("\n" + "=" * 60)
     print("Step 2: 提取PDF内嵌文本")
@@ -132,6 +106,7 @@ def run_pipeline(
         text_file.write_text(text, encoding="utf-8")
     print(f"✓ 已提取 {len(pdf_texts)} 页文本")
     timings["Step 2: Extract PDF Text"] = time.perf_counter() - step_start
+
     # ── Step 3: DeepSeek OCR ──
     print("\n" + "=" * 60)
     print("Step 3: DeepSeek OCR-2")
@@ -152,6 +127,7 @@ def run_pipeline(
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页 OCR 失败: {e}")
     timings["Step 3: DeepSeek OCR"] = time.perf_counter() - step_start
+
     # ── Step 4: GPT 校正 ──
     print("\n" + "=" * 60)
     print("Step 4: GPT 校正")
@@ -160,7 +136,6 @@ def run_pipeline(
     for page_num in tqdm(range(1, num_pages + 1), desc="GPT校正"):
         ocr_file = ocr_dir / f"page-{page_num}.md"
         gpt_output = gpt_dir / f"page-{page_num}.md"
-        # A = OCR 原文（校正前），B = GPT 回复（校正内容/理由）
         gpt_raw_a = gpt_raw_a_dir / f"page-{page_num}.md"
         gpt_raw_b = gpt_raw_b_dir / f"page-{page_num}.md"
         image_path = images_dir / f"{page_num}.png"
@@ -183,14 +158,32 @@ def run_pipeline(
                 temperature=gpt_temperature,
             )
             gpt_output.write_text(gpt_result.corrected, encoding="utf-8")
-            # A: 有变化的 segment 写原文，<|ok|> 的写 <|ok|>（diff 左侧）
             gpt_raw_a.write_text(gpt_result.raw_a, encoding="utf-8")
-            # B: 有变化的 segment 写 GPT 回复，<|ok|> 的写 <|ok|>（diff 右侧）
             gpt_raw_b.write_text(gpt_result.raw_b, encoding="utf-8")
+            # 【新增】将本次摘要独立存储留作备查
+            (gpt_summary_pages_dir / f"page-{page_num}.md").write_text(gpt_result.summary, encoding="utf-8")
             print(f"  ✓ 第 {page_num} 页 GPT 校正完成")
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页 GPT 校正失败: {e}")
+
+    # ── 【新增】Step 4.5 汇总所有的 Markdown 差异表格 ──
+    summary_lines = ["# GPT Correction Summary\n"]
+    for page_num in range(1, num_pages + 1):
+        summary_lines.append(f"## Page {page_num}\n")
+        page_summary_file = gpt_summary_pages_dir / f"page-{page_num}.md"
+        if page_summary_file.exists():
+            content = page_summary_file.read_text(encoding="utf-8").strip()
+            if content:
+                summary_lines.append(content + "\n")
+            else:
+                summary_lines.append("*No modifications*\n")
+        else:
+            summary_lines.append("*No summary available*\n")
+        summary_lines.append("\n---\n")
+    (gpt_raw_dir / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
+
     timings["Step 4: GPT Correction"] = time.perf_counter() - step_start
+
     # ── Step 5: 后处理 ──
     print("\n" + "=" * 60)
     print("Step 5: 后处理 (提取图片、绘制边框)")
@@ -215,6 +208,7 @@ def run_pipeline(
         except Exception as e:
             print(f"  ✗ 第 {page_num} 页后处理失败: {e}")
     timings["Step 5: Post-processing"] = time.perf_counter() - step_start
+
     if merge_markdown:
         # ── Step 6: 合并所有页 Markdown ──
         print("\n" + "=" * 60)
@@ -228,6 +222,7 @@ def run_pipeline(
             print(f"✗ 合并 Markdown 失败: {e}")
         timings["Step 6: Merge Markdown"] = time.perf_counter() - step_start
     total_time = time.perf_counter() - pipeline_start
+
     # ── 完成 ──
     print("\n" + "=" * 60)
     print("全部完成!")
@@ -240,6 +235,7 @@ def run_pipeline(
     print(f"  GPT校正结果:    {gpt_dir}")
     print(f"  GPT原始回复 A:  {gpt_raw_a_dir}  (OCR原文，diff左侧)")
     print(f"  GPT原始回复 B:  {gpt_raw_b_dir}  (GPT回复，diff右侧)")
+    print(f"  修改内容汇总:   {gpt_raw_dir / 'summary.md'}  (包含对比图片与前后文本)") # <-- 【新增】友好的输出提示
     print(f"  最终输出:       {output_dir}")
     print(f"\n每个页面的输出包括:")
     print(f"  - result.md:             处理后的markdown文件(带图片引用)")
