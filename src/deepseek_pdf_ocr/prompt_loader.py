@@ -34,14 +34,22 @@ def load_markdown_messages(path: str | Path, dump_json: str | Path | None = None
             img = next((c.attrGet("src") for c in (inline.children or []) if c.type == "image"), None)
 
             if img:
-                p = (path.parent / img).resolve()
-                if p.exists():
-                    mime = mimetypes.guess_type(p)[0] or "image/png"
-                    b64 = base64.b64encode(p.read_bytes()).decode()
+                if img.startswith(("http://", "https://")):
                     content.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        "image_url": {"url": img},
                     })
+                else:
+                    p = (path.parent / img).resolve()
+                    if p.exists():
+                        mime = mimetypes.guess_type(p)[0] or "image/png"
+                        b64 = base64.b64encode(p.read_bytes()).decode()
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    else:
+                        add_text("".join(lines[slice(*(t.map or (0, 0)))]))
             else:
                 add_text("".join(lines[slice(*(t.map or (0, 0)))]))
 
