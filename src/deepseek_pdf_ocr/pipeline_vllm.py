@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import re
 import time
+import json
 from pathlib import Path
 from typing import Sequence
 from openai import OpenAI
@@ -27,10 +28,9 @@ def _encode_image_b64(path: str | Path) -> str:
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
-_IMAGE_MARKER_RE = re.compile(r"<!--\s*image\s+(\d+)\s*-->")
+_IMAGE_MARKER_RE = re.compile(chr(60) + "!--\s*image\s+(\d+)\s*--" + chr(62))
 
 def _split_batch_response(text: str, expected: int) -> list[str]:
-    # ... 保持原样 ...
     if expected <= 1:
         return [text.strip()]
     markers = list(_IMAGE_MARKER_RE.finditer(text))
@@ -59,7 +59,6 @@ def _run_batch_ocr(
     batch_size: int,
     prompt: str | None = None,
 ) -> None:
-    # ... 保持原样 ...
     client = OpenAI(api_key=api_key, base_url=base_url)
     todo: list[int] = []
     for pn in page_nums:
@@ -119,6 +118,7 @@ def run_pipeline_vllm(
     gpt_max_workers: int = 8,
     merge_markdown: bool = True,
     merged_filename: str = "ocr.md",
+    stop_after_ocr: bool = False,
 ) -> Path:
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -135,19 +135,50 @@ def run_pipeline_vllm(
     gpt_raw_a_dir = gpt_raw_dir / "A"   
     gpt_raw_b_dir = gpt_raw_dir / "B"   
     gpt_summary_pages_dir = gpt_raw_dir / "summary_pages"
-    gpt_readable_pages_dir = gpt_raw_dir / "readable_pages" # <-- 【新增】易读版缓存文件夹
+    gpt_readable_pages_dir = gpt_raw_dir / "readable_pages" 
     output_dir = base_dir / "output"
 
     for d in (
         base_dir, images_dir, text_dir, ocr_dir,
         gpt_dir, gpt_raw_dir, gpt_raw_a_dir, gpt_raw_b_dir, gpt_summary_pages_dir,
-        gpt_readable_pages_dir, # <-- 【新增】
+        gpt_readable_pages_dir, 
         output_dir,
     ):
         d.mkdir(parents=True, exist_ok=True)
     num_pages = get_page_count(pdf_path)
 
-    # ... [Step 1 到 Step 3 均保持不变] ...
+    # 【修改】转为 JSON 格式，支持保存每次运行历史和计算综合累计耗时
+    time_log_file = base_dir / "time_consumption.json"
+    
+    def _record_time(step_name: str, start_t: float) -> None:
+        timings[step_name] = time.perf_counter() - start_t
+
+    def _save_and_get_cumulative_timings(current_total: float) -> tuple[dict[str, float], float]:
+        log_data = {"cumulative_timings": {}, "runs": []}
+        if time_log_file.exists():
+            try:
+                log_data = json.loads(time_log_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        
+        # 记录本次真实耗时
+        log_data["runs"].append({
+            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "timings": timings.copy(),
+            "total_time": current_total
+        })
+
+        # 计算累计耗时：取历史最大值，完美解决缓存跳过导致显示 0 秒的问题
+        cum_timings = log_data.get("cumulative_timings", {})
+        for k, v in timings.items():
+            cum_timings[k] = max(cum_timings.get(k, 0.0), v)
+            
+        log_data["cumulative_timings"] = cum_timings
+        time_log_file.write_text(json.dumps(log_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        
+        # 返回修正后的累计字典与累计总耗时，用于终端打印
+        return cum_timings, sum(cum_timings.values())
+
     # ════════════ Step 1: PDF → 高清图像 ════════════
     print("=" * 60)
     print("Step 1: PDF 转高清图像")
@@ -158,7 +189,7 @@ def run_pipeline_vllm(
         print(f"✓ 检测到已存在 {num_pages} 张图像，跳过转换。")
     else:
         num_pages = pdf_to_images(pdf_path, images_dir, dpi=dpi)
-    timings["Step 1: PDF to Images"] = time.perf_counter() - t0
+    _record_time("Step 1: PDF to Images", t0)
 
     # ════════════ Step 2: 提取 PDF 内嵌文本 ════════════
     print("\n" + "=" * 60)
@@ -169,7 +200,7 @@ def run_pipeline_vllm(
     for pn, txt in pdf_texts.items():
         (text_dir / f"page-{pn}-text.txt").write_text(txt, encoding="utf-8")
     print(f"✓ 已提取 {len(pdf_texts)} 页文本")
-    timings["Step 2: Extract PDF Text"] = time.perf_counter() - t0
+    _record_time("Step 2: Extract PDF Text", t0)
 
     # ════════════ Step 3: DeepSeek OCR (vLLM batch) ════════════
     print("\n" + "=" * 60)
@@ -185,7 +216,17 @@ def run_pipeline_vllm(
         model=ds_model,
         batch_size=ds_batch_size,
     )
-    timings["Step 3: DeepSeek OCR (vLLM)"] = time.perf_counter() - t0
+    _record_time("Step 3: DeepSeek OCR (vLLM)", t0)
+
+    # 【新增】触发自动停止
+    if stop_after_ocr:
+        total_time = time.perf_counter() - t_pipeline
+        print("\n" + "🛑" * 30)
+        print("已开启 stop_after_ocr，OCR阶段完成，主动停止运行。")
+        print("🛑" * 30)
+        cum_timings, cum_total = _save_and_get_cumulative_timings(total_time)
+        _print_timing_report(cum_timings, cum_total)
+        return output_dir
 
     # ════════════ Step 4: GPT 校正 ════════════
     print("\n" + "=" * 60)
@@ -222,7 +263,7 @@ def run_pipeline_vllm(
             gpt_raw_b.write_text(result.raw_b, encoding="utf-8")
             
             (gpt_summary_pages_dir / f"page-{pn}.md").write_text(result.summary, encoding="utf-8")
-            (gpt_readable_pages_dir / f"page-{pn}.md").write_text(result.readable_summary, encoding="utf-8") # <-- 【新增】写出按页易读文件
+            (gpt_readable_pages_dir / f"page-{pn}.md").write_text(result.readable_summary, encoding="utf-8") 
             
             print(
                 f"  ✓ 第 {pn} 页 GPT 校正完成"
@@ -234,7 +275,7 @@ def run_pipeline_vllm(
             
     # ── Step 4.5 汇总所有的 Markdown 差异表格及易读版 ──
     summary_lines = ["# GPT Correction Summary\n"]
-    readable_lines = ["# GPT Correction Readable Log\n"] # <-- 【新增】汇总易读版
+    readable_lines = ["# GPT Correction Readable Log\n"]
     
     for pn in range(1, num_pages + 1):
         summary_lines.append(f"## Page {pn}\n")
@@ -249,7 +290,6 @@ def run_pipeline_vllm(
             summary_lines.append("*No summary available*\n")
         summary_lines.append("\n---\n")
 
-        # 处理 readable 版本
         readable_lines.append(f"## Page {pn}\n")
         page_readable_file = gpt_readable_pages_dir / f"page-{pn}.md"
         if page_readable_file.exists():
@@ -263,11 +303,11 @@ def run_pipeline_vllm(
         readable_lines.append("\n---\n")
 
     (gpt_raw_dir / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
-    (gpt_raw_dir / "readable_summary.md").write_text("\n".join(readable_lines), encoding="utf-8") # <-- 【新增】写盘
+    (gpt_raw_dir / "readable_summary.md").write_text("\n".join(readable_lines), encoding="utf-8") 
 
-    timings["Step 4: GPT Correction"] = time.perf_counter() - t0
+    _record_time("Step 4: GPT Correction", t0)
 
-    # ════════════ Step 5: 后处理 ════════════ (保持原样)
+    # ════════════ Step 5: 后处理 ════════════ 
     print("\n" + "=" * 60)
     print("Step 5: 后处理 (提取图片、绘制边框)")
     print("=" * 60)
@@ -290,9 +330,9 @@ def run_pipeline_vllm(
             print(f"  ✓ 第 {pn} 页后处理完成")
         except Exception as e:
             print(f"  ✗ 第 {pn} 页后处理失败: {e}")
-    timings["Step 5: Post-processing"] = time.perf_counter() - t0
+    _record_time("Step 5: Post-processing", t0)
 
-    # ════════════ Step 6: 合并 Markdown ════════════ (保持原样)
+    # ════════════ Step 6: 合并 Markdown ════════════ 
     if merge_markdown:
         print("\n" + "=" * 60)
         print("Step 6: 合并所有页 Markdown")
@@ -305,32 +345,31 @@ def run_pipeline_vllm(
             print(f"✓ 已生成合并文件: {merged_md}")
         except Exception as e:
             print(f"✗ 合并 Markdown 失败: {e}")
-        timings["Step 6: Merge Markdown"] = time.perf_counter() - t0
+        _record_time("Step 6: Merge Markdown", t0)
+
     total_time = time.perf_counter() - t_pipeline
+    cum_timings, cum_total = _save_and_get_cumulative_timings(total_time)
 
     # ── Summary ──
     print("\n" + "=" * 60)
     print("全部完成!")
     print("=" * 60)
     print(f"  PDF文件:        {pdf_path}")
-    print(f"  工作目录:       {base_dir}")
-    print(f"  页面图像:       {images_dir}")
+    print(f"  工作目录:        {base_dir}")
+    print(f"  耗时记录:        {time_log_file}  <-- 【已转为 JSON，包含历史与累计耗时】")
+    print(f"  页面图像:        {images_dir}")
     print(f"  PDF内嵌文本:    {text_dir}")
     print(f"  OCR原始结果:    {ocr_dir}")
     print(f"  GPT校正结果:    {gpt_dir}")
     print(f"  GPT原始回复 A:  {gpt_raw_a_dir}  (OCR原文，diff左侧)")
     print(f"  GPT原始回复 B:  {gpt_raw_b_dir}  (GPT回复，diff右侧)")
-    print(f"  修改内容汇总:   {gpt_raw_dir / 'summary.md'}  (包含对比图片与前后文本)") 
-    print(f"  易读格式汇总:   {gpt_raw_dir / 'readable_summary.md'}  (包含原始Prompt格式输出)") # <-- 【新增】控制台提示
-    print(f"  最终输出:       {output_dir}")
-    print(f"  OCR 批大小:     {ds_batch_size}")
-    print(f"  GPT 并行数:     {gpt_max_workers}")
-    print(f"\n每个页面的输出包括:")
-    print(f"  - result.md:             处理后的markdown文件(带图片引用)")
-    print(f"  - result_with_boxes.jpg: 带可视化边框的图片")
-    print(f"  - images/:               提取的图片文件夹")
+    print(f"  修改内容汇总:    {gpt_raw_dir / 'summary.md'}  (包含对比图片与前后文本)") 
+    print(f"  易读格式汇总:    {gpt_raw_dir / 'readable_summary.md'}  (包含原始Prompt格式输出)") 
+    print(f"  最终输出:        {output_dir}")
+    print(f"  OCR 批大小:      {ds_batch_size}")
+    print(f"  GPT 并行数:      {gpt_max_workers}")
     print(f"\nVSCode diff 用法:")
     print(f"  在 gpt5.2-raw/ 目录下，A/ 为校正前原文，B/ 为GPT回复")
     print(f"  右键 A/page-N.md → 「选择以进行比较」，再右键 B/page-N.md → 「与已选项目比较」")
-    _print_timing_report(timings, total_time)
+    _print_timing_report(cum_timings, cum_total)
     return output_dir

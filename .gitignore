@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 tmp_*
 *.debug.json
+cat.png
+examples.md
