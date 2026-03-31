@@ -30,7 +30,7 @@ _SEARCH_REPLACE_RE = re.compile(
 )
 
 _COORD_MAX = 999
-_CROP_PADDING = 8
+_CROP_PADDING = 0
 
 @dataclass
 class Segment:
@@ -262,7 +262,7 @@ def run_gpt_correction(
     api_key: str,
     endpoint: str,
     model: str = "gpt-5.2",
-    temperature: float = 1.0,
+    temperature: float = 0.1,
     max_workers: int = 8,
 ) -> CorrectionResult:
     if not ocr_result.strip():

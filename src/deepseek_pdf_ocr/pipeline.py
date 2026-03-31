@@ -55,7 +55,7 @@ def run_pipeline(
     dpi: int = 300,
     ds_model: str = "deepseek-ocr-2",
     gpt_model: str = "gpt-5.4",
-    gpt_temperature: float = 1.0,
+    gpt_temperature: float = 0.1,
     merge_markdown: bool = True,
     merged_filename: str = "ocr.md",
     stop_after_ocr: bool = False,

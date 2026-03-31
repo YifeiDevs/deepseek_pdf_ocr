@@ -114,7 +114,7 @@ def run_pipeline_vllm(
     ds_model: str = "deepseek-ocr-2",
     ds_batch_size: int = 1,
     gpt_model: str = "gpt-5.4",
-    gpt_temperature: float = 1.0,
+    gpt_temperature: float = 0.1,
     gpt_max_workers: int = 8,
     merge_markdown: bool = True,
     merged_filename: str = "ocr.md",
