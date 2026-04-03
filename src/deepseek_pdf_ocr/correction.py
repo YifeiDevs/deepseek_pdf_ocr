@@ -1,6 +1,7 @@
 # src/deepseek_pdf_ocr/correction.py
 from __future__ import annotations
 import base64
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -10,8 +11,9 @@ from pathlib import Path
 from openai import OpenAI
 from PIL import Image
 
-# 引入现有的 prompt loader
+# 引入现有的 prompt loader 和 filter
 from deepseek_pdf_ocr.prompt_loader import load_markdown_messages
+from deepseek_pdf_ocr.change_filter import filter_candidate_text, review_change
 
 OK_PLACEHOLDER = "<|ok|>"
 
@@ -35,8 +37,8 @@ _CROP_PADDING = 0
 @dataclass
 class Segment:
     index: int
-    header: str       
-    body: str         
+    header: str        
+    body: str          
     is_image: bool = False
     coords: list[list[int]] = field(default_factory=list)
 
@@ -57,7 +59,7 @@ class CorrectionResult:
     raw_a: str = ""            
     raw_b: str = ""            
     summary: str = ""          
-    readable_summary: str = "" # <-- 【新增】用于记录新格式的易读版本
+    readable_summary: str = ""
     n_segments: int = 0
     n_sent: int = 0
     n_ok: int = 0
@@ -194,7 +196,7 @@ def _correct_one_segment(
     client: OpenAI,
     model: str,
     temperature: float,
-    messages_template: list[dict], # <-- 【新增】传入已加载的 few-shot 模板
+    messages_template: list[dict], 
 ) -> tuple[int, str]:
     
     # 深度拷贝，防止多线程污染模板
@@ -309,7 +311,7 @@ def run_gpt_correction(
                 client,
                 model,
                 temperature,
-                messages_template, # 传入模板
+                messages_template, 
             ): seg
             for seg in non_image
         }
@@ -325,9 +327,42 @@ def run_gpt_correction(
                 corrections[seg.index] = OK_PLACEHOLDER
                 raw_parts.append(f"[{seg.index}] (error: {exc})")
 
-    corrected = _reassemble(ocr_result, segments, corrections)
-    # 【修改点】同样使用 in 判断
-    n_ok = sum(1 for v in corrections.values() if OK_PLACEHOLDER in v or "<|abort|>" in v)
+    # =========================================================================
+    # 插入 Change Filter 复核工序 (使用 gpt-5.2)
+    # =========================================================================
+    applied_corrections = dict(corrections)
+    filter_decisions = {}
+
+    for seg in non_image:
+        idx = seg.index
+        gpt_reply = corrections.get(idx, OK_PLACEHOLDER)
+        is_ok = OK_PLACEHOLDER in gpt_reply or "<|abort|>" in gpt_reply
+        original_text = seg.body.strip()
+
+        if is_ok:
+            continue
+
+        if "<<<<" in gpt_reply and "====" in gpt_reply and ">>>>" in gpt_reply:
+            candidate_text = _apply_search_replace(seg.body, gpt_reply, idx).strip()
+        else:
+            candidate_text = gpt_reply.strip()
+
+        if candidate_text != original_text:
+            _, decision = filter_candidate_text(
+                original_text=original_text,
+                candidate_text=candidate_text,
+                client=client,
+                model="gpt-5.2",  # 显式指定采用 gpt-5.2 进行终审拦截
+                crop_imgs=crops.get(idx),
+                page_image=page_image,
+            )
+            filter_decisions[idx] = decision
+            if not decision.keep:
+                # 记录阻截，丢弃该候选修改，在回填时视为未修改
+                applied_corrections[idx] = OK_PLACEHOLDER
+
+    corrected = _reassemble(ocr_result, segments, applied_corrections)
+    n_ok = sum(1 for v in applied_corrections.values() if OK_PLACEHOLDER in v or "<|abort|>" in v)
 
     # =========================================================================
     # 生成 A/B diff 文件内容 以及 summary 的 Markdown 表格 和 易读排版版
@@ -338,7 +373,7 @@ def run_gpt_correction(
     a_parts: list[str] = []
     b_parts: list[str] = []
     summary_parts: list[str] = []   
-    readable_parts: list[str] = []  # <-- 【新增】收集易读的 Markdown 格式
+    readable_parts: list[str] = []  
 
     for idx in all_indices:
         seg = seg_by_idx[idx]
@@ -349,9 +384,9 @@ def run_gpt_correction(
             continue
 
         gpt_reply = corrections.get(idx, OK_PLACEHOLDER)
-        # 【修改点】改为基于 in 判断
         is_ok = OK_PLACEHOLDER in gpt_reply or "<|abort|>" in gpt_reply
         original_text = seg.body.strip()
+        decision = filter_decisions.get(idx)
 
         if is_ok:
             corrected_text = original_text
@@ -360,18 +395,24 @@ def run_gpt_correction(
         else:
             corrected_text = gpt_reply.strip()
 
-        if is_ok:
-            a_parts.append(f"[{idx}]\n<|ok|>")
-            # 【优化】即使跳过了修改，在后端的 GPT回复日志(B文件夹) 中仍然保留真实的 diagnosis 过程供排查
-            b_parts.append(f"[{idx}]\n{gpt_reply.strip()}")
-        elif original_text == corrected_text:
-            a_parts.append(f"[{idx}]\n<|same|>")
-            # 【优化】同上
+        # is_modified_by_gpt 指示 GPT 是否原生地提出了不同于原文的修改
+        is_modified_by_gpt = (corrected_text != original_text and not is_ok)
+        is_dropped = (decision is not None and not decision.keep)
+        effective_text = original_text if is_dropped else corrected_text
+
+        if not is_modified_by_gpt:
+            if is_ok:
+                a_parts.append(f"[{idx}]\n<|ok|>")
+            else:
+                a_parts.append(f"[{idx}]\n<|same|>")
             b_parts.append(f"[{idx}]\n{gpt_reply.strip()}")
         else:
-            # 文本确实发生了实质性改变，这下面的 readable_parts 逻辑会被完美触发
-            a_parts.append(f"[{idx}]\n{original_text}")
-            b_parts.append(f"[{idx}]\n{corrected_text}")
+            if is_dropped:
+                a_parts.append(f"[{idx}]\n<|same|>")
+                b_parts.append(f"[{idx}]\n{gpt_reply.strip()}")
+            else:
+                a_parts.append(f"[{idx}]\n{original_text}")
+                b_parts.append(f"[{idx}]\n{effective_text}")
 
             img_tags = []
             img_filename = Path(image_path).name
@@ -405,7 +446,7 @@ def run_gpt_correction(
                 txt = txt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 return txt.replace("|", "&#124;").replace("\n", "<br>")
             
-            summary_part = "\n".join(img_tags) + f"\n\n| Original | Modified |\n| --- | --- |\n| {esc(original_text)} | {esc(corrected_text)} |"
+            summary_part = "\n".join(img_tags) + f"\n\n| Original | Modified |\n| --- | --- |\n| {esc(original_text)} | {esc(effective_text)} |"
             summary_parts.append(summary_part)
 
             # 2. 构造【新增】易于观看的 readable_summary.md 片段
@@ -418,6 +459,11 @@ def run_gpt_correction(
             readable_part.append("#### Assistant")
             readable_part.append(gpt_reply)
             
+            # 如果被 Drop，在此处显著标记，方便复查！
+            if is_dropped:
+                drop_json = json.dumps({"reason": decision.reason, "decision": "DROP"}, ensure_ascii=False)
+                readable_part.append(f"\n#### Filter Decision\n```json\n{drop_json}\n```")
+
             readable_parts.append("\n".join(readable_part))
 
     sep = "\n---\n"
@@ -425,7 +471,7 @@ def run_gpt_correction(
     raw_b = sep.join(b_parts)
     raw_response = sep.join(sorted(raw_parts))
     summary_md = "\n\n---\n\n".join(summary_parts) if summary_parts else ""
-    readable_md = "\n\n---\n\n".join(readable_parts) if readable_parts else "" # <-- 【新增】
+    readable_md = "\n\n---\n\n".join(readable_parts) if readable_parts else "" 
 
     return CorrectionResult(
         corrected=corrected,
@@ -433,7 +479,7 @@ def run_gpt_correction(
         raw_a=raw_a,
         raw_b=raw_b,
         summary=summary_md,
-        readable_summary=readable_md, # <-- 【新增】
+        readable_summary=readable_md,
         n_segments=len(segments),
         n_sent=len(non_image),
         n_ok=n_ok,
